@@ -26,44 +26,59 @@ const fs = require("fs");
 const LOCK_DIR = path.join(require("os").tmpdir(), "ai_locks");
 try { fs.mkdirSync(LOCK_DIR, { recursive: true }); } catch (_) {}
 
-// Simple file-based mutex: each provider gets a lock file with the PID.
-// Workers skip providers locked by another process (still running).
+// Atomic mkdir-based mutex — fs.mkdirSync() is atomic on all POSIX filesystems.
+// Each provider gets a directory under LOCK_DIR; only the process that successfully
+// creates the directory holds the lock. PID is written into <dir>/pid for stale detection.
+// This eliminates the TOCTOU race between existsSync/unlinkSync/writeFileSync('wx').
 function acquireLock(provider) {
-    const f = path.join(LOCK_DIR, provider);
+    const lockDir = path.join(LOCK_DIR, provider);
     try {
-        // Check if existing lock is stale (process dead)
-        if (fs.existsSync(f)) {
-            const oldPid = parseInt(fs.readFileSync(f, "utf8").trim(), 10);
-            try { process.kill(oldPid, 0); } catch (_) {
-                // Stale lock — PID no longer exists
-                fs.unlinkSync(f);
-            }
-        }
-        // Try to create (fail if another process beat us to it)
-        fs.writeFileSync(f, String(process.pid), { flag: "wx" });
+        fs.mkdirSync(lockDir);  // atomic — exactly one process wins
+        fs.writeFileSync(path.join(lockDir, "pid"), String(process.pid));
         return true;
     } catch (_) {
-        return false; // locked by another running process
+        // Directory exists — check if the owning process is still alive
+        try {
+            const pidFile = path.join(lockDir, "pid");
+            const oldPid = parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+            try { process.kill(oldPid, 0); } catch (_) {
+                // Stale lock — remove and retry atomically
+                fs.rmSync(lockDir, { recursive: true, force: true });
+                try {
+                    fs.mkdirSync(lockDir);
+                    fs.writeFileSync(path.join(lockDir, "pid"), String(process.pid));
+                    return true;
+                } catch (_) { /* another process beat us */ }
+            }
+        } catch (_) { /* can't read pid file */ }
+        return false;
     }
 }
 
 function releaseLock(provider) {
-    const f = path.join(LOCK_DIR, provider);
+    const lockDir = path.join(LOCK_DIR, provider);
     try {
-        const data = fs.readFileSync(f, "utf8").trim();
-        if (parseInt(data, 10) === process.pid) fs.unlinkSync(f);
+        const pidFile = path.join(lockDir, "pid");
+        const data = fs.readFileSync(pidFile, "utf8").trim();
+        if (parseInt(data, 10) === process.pid) {
+            fs.rmSync(lockDir, { recursive: true, force: true });
+        }
     } catch (_) {}
 }
 
 // Cleanup all locks owned by this process on exit (prevent stale locks)
 function cleanupAllLocks() {
-    const files = fs.readdirSync(LOCK_DIR);
-    for (const f of files) {
-        const p = path.join(LOCK_DIR, f);
+    let entries;
+    try { entries = fs.readdirSync(LOCK_DIR); } catch (_) { return; }
+    for (const name of entries) {
+        const lockDir = path.join(LOCK_DIR, name);
         try {
-            const data = fs.readFileSync(p, "utf8").trim();
-            if (parseInt(data, 10) === process.pid) fs.unlinkSync(p);
-        } catch (_) {}
+            const pidFile = path.join(lockDir, "pid");
+            const data = fs.readFileSync(pidFile, "utf8").trim();
+            if (parseInt(data, 10) === process.pid) {
+                fs.rmSync(lockDir, { recursive: true, force: true });
+            }
+        } catch (_) { /* skip non-lock directories */ }
     }
 }
 process.on("exit", cleanupAllLocks);
@@ -92,7 +107,8 @@ const KEEP_TABS = true;
 // UTILS
 // ═══════════════════════════════════════════════════════════════════
 
-function log(msg) { process.stderr.write(`[orch] ${msg}\n`); }
+const { log: _log } = require('../lib/terminal');
+const log = (msg) => _log('orch', msg);
 function ts() { return new Date().toISOString().slice(11, 19); }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -244,7 +260,6 @@ const UI_CHROME_PATTERNS = [
   /^Claude\s*responded[：:\s]*/gim,
   /^ChatGPT\s*said[：:\s]*/gim,
   /^Kimi\s*说[：:\s]*/gim,
-  /^Qwen[\d.]+-(?:Max|Plus|Turbo|Flash)\s*\n?\s*/gim,
   /Thought\s*for\s*\d+s?\s*/gi,
   /^You said[：:\s]*.*?\n/gim,
   /^Zi[，,]\s*(?:接著要做什麼|在想什麼|我們進入正題|你好).*/gim,
@@ -265,39 +280,11 @@ function cleanResponse(text) {
 
 function normalizeAI(name) {
   const n = (name || "").toLowerCase().trim();
-  const map = { gpt: "chatgpt", chatgpt: "chatgpt", gemini: "gemini", kimi: "kimi", qwen: "qwen", claude: "claude", minimax: "minimax" };
+  const map = { gpt: "chatgpt", chatgpt: "chatgpt", gemini: "gemini", kimi: "kimi", qwen: "qwen", claude: "claude", minimax: "minimax", deepseek: "deepseek", mimo: "mimo" };
   return map[n] || n;
 }
 
-const DAG_DECOMPOSER_PROMPT = `You are a task decomposition expert. Given a complex user task, assign complementary sub-tasks to 4 AI specialists.
-
-AI ROLES (complementary, non-overlapping — each AI does DIFFERENT work):
-- Gemini (depth_reasoner): Multi-step logic, mathematical analysis, scientific reasoning, complex deduction
-- GPT (creative_builder): Code generation, solution design, creative writing, synthesis, actionable recommendations
-- Kimi (researcher): Long-context analysis, literature review, detailed fact extraction, background research
-- Qwen (reviewer_retriever): Fact verification, cross-reference checking, Chinese-language tasks, web retrieval
-
-CRITICAL RULES:
-1. ALL 4 nodes run SIMULTANEOUSLY. Every node must have empty depends_on=[] UNLESS a node's prompt LITERALLY cannot be written without another node's output.
-2. READ THE USER TASK CAREFULLY. The task is: ▶▶▶ <TASK> ◀◀◀ Do NOT invent a different task.
-3. Each prompt must demand a DIRECT FINAL ANSWER. Start with "请直接给出..." / "Provide a complete analysis of..." / "List the specific..." — NEVER write prompts that describe what the AI will do.
-4. Each AI gets a DIFFERENT angle on the task — no two answering the same question.
-5. Output JSON ONLY (no markdown, no backticks):
-{
-  "dag": {
-    "nodes": [
-      {
-        "id": "angle_1",
-        "ai": "Kimi",
-        "role": "researcher",
-        "goal": "one-line description",
-        "depends_on": [],
-        "prompt": "Self-contained, actionable prompt with embedded context..."
-      },
-      ...
-    ]
-  }
-}`;
+const { DAG_DECOMPOSER_PROMPT } = require('../lib/prompts');
 
 function tryParsePreDecomposedPlan(userTask) {
   // Detect if input is already a pre-decomposed JSON plan with "subtasks" array
@@ -454,113 +441,204 @@ async function dispatchParallel(dag, budgetMs) {
 // MODULE 3: EVIDENCE ARBITRATOR
 // ═══════════════════════════════════════════════════════════════════
 
+// ── Shared helpers ──
+
+/** Split text into sentences, keeping the sentence intact. */
+function sentences(text) {
+  return (text || "").split(/(?<=[。！？!?\n])\s*/).filter(s => s.trim().length > 8);
+}
+
+/** Extract key phrases: numbers+units, chemical formulas, quoted terms, proper nouns. */
+function keyPhrases(text) {
+  const found = new Set();
+  // numbers with common scientific units
+  for (const m of text.matchAll(/([\d.]+)\s*(eV|Å|kcal\/mol|kJ\/mol|nm|pm|kcal|kJ|％|%|degree|K\b)/gi)) {
+    found.add(m[0].toLowerCase());
+  }
+  // chemical formulas (Ag, HCl, H₂O, Cu(111), etc.)
+  for (const m of text.matchAll(/\b(?:[A-Z][a-z]?(?:\d+)?(?:\([^)]*\))?){1,4}\b/g)) {
+    const t = m[0].trim();
+    if (t.length >= 2 && !/^(The|This|In|On|We|It|Is|No|To|He|She|They|For|And|But|Or|A|An)$/i.test(t)) {
+      found.add(t.toLowerCase());
+    }
+  }
+  return [...found];
+}
+
+// ── Trust Tiers ──
+
+function assignTrust(node, result) {
+  if (!result?.output?.response) return { tier: "MISSING", provider: result?.output?.provider_used || null, reason: result?.output?.error || "no response" };
+  const deg = result.output.degradation;
+  if (deg) return {
+    tier: "DEGRADED",
+    provider: result.output.provider_used,
+    intended: result.output.primary_intended,
+    reason: deg.reason,
+  };
+  const short = result.output.response.length < 50;
+  return { tier: short ? "DEGRADED" : "FULL", provider: result.output.provider_used, reason: short ? "response too short" : null };
+}
+
+// ── Check: Reviewer Alerts ──
+
+function reviewerAlerts(reviewerText, researcherText, reasonerText) {
+  const NEGATION_RE = /(?:错误|不一致|应为|并非|contradiction|不准确|遗漏|忽略|missing|wrong|incorrect|disagree|不符合|有误|忽视了|没有考虑)/i;
+  const alerts = [];
+  for (const sent of sentences(reviewerText)) {
+    if (!NEGATION_RE.test(sent)) continue;
+    const phrases = keyPhrases(sent);
+    if (phrases.length === 0) continue;
+    const inResearcher = phrases.filter(p => (researcherText || "").toLowerCase().includes(p));
+    const inReasoner   = phrases.filter(p => (reasonerText || "").toLowerCase().includes(p));
+    const targets = [];
+    if (inResearcher.length > 0) targets.push("researcher");
+    if (inReasoner.length > 0) targets.push("reasoner");
+    if (targets.length > 0) {
+      alerts.push({ targets, sentence: sent.trim().slice(0, 200), on_entities: [...new Set([...inResearcher, ...inReasoner])] });
+    }
+  }
+  return alerts;
+}
+
+// ── Check: Synthesis Gap ──
+
+function synthesisGap(builderText, sources) {
+  const gaps = [];
+  // researcher: entity coverage
+  if (sources.researcher) {
+    const ents = keyPhrases(sources.researcher);
+    const hit = ents.filter(e => (builderText || "").toLowerCase().includes(e));
+    if (ents.length > 2 && hit.length / ents.length < 0.4) {
+      gaps.push({ from: "researcher", type: "entity_coverage", rate: `${hit.length}/${ents.length}`, detail: "资料关键实体在综合报告中覆盖率不足" });
+    }
+  }
+  // reasoner: conclusion absorption
+  if (sources.reasoner) {
+    const concl = sentences(sources.reasoner).filter(s =>
+      /(?:因此|所以|thus|therefore|结论|conclusion|综上|hence|accordingly)/i.test(s)
+    );
+    const absorbed = concl.filter(s => {
+      const words = s.replace(/[，,。！？.!?\s]+/g, " ").trim().split(/\s+/).slice(0, 8).join(" ");
+      return words.length > 8 && (builderText || "").toLowerCase().includes(words.toLowerCase());
+    });
+    if (concl.length >= 2 && absorbed.length === 0) {
+      gaps.push({ from: "reasoner", type: "conclusion_missing", detail: "推理者结论未被综合报告吸收" });
+    } else if (concl.length >= 2 && absorbed.length < concl.length) {
+      gaps.push({ from: "reasoner", type: "partial_absorption", detail: `推理者 ${concl.length} 条结论仅 ${absorbed.length} 条被纳入` });
+    }
+  }
+  // reviewer: flag response
+  if (sources.reviewer) {
+    const hasNegation = /(?:错误|不一致|应为|并非|contradiction|不准确|遗漏|忽略)/i.test(sources.reviewer);
+    if (hasNegation && !/(?:存疑|uncertain|may\s+not|possibly|有待|需要进一步|limitation)/i.test(builderText || "")) {
+      gaps.push({ from: "reviewer", type: "flag_unacknowledged", detail: "审阅者发现问题但综合报告未回应" });
+    }
+  }
+  return gaps;
+}
+
+// ── Arbitration ──
+
 function arbitrateResults(dag, results) {
   log("━━━ Module 3: Evidence Arbitration ━━━");
 
   const nodes = dag.nodes;
-  const arbitration = {
-    summary: "",
-    findings: [],
-    contradictions: [],
-    degradations: [],
-    overall_confidence: 1.0,
-  };
+  const trust = {};
+  for (const node of nodes) {
+    trust[node.id] = assignTrust(node, results[node.id]);
+  }
 
-  // Collect degradation reports
+  // Resolve role texts (role name → actual response)
+  const roleText = {};
   for (const node of nodes) {
     const r = results[node.id];
-    if (!r) {
-      arbitration.degradations.push({ node_id: node.id, role: node.role, reason: "NO_RESULT" });
-      continue;
-    }
-    if (r.output.degradation) {
-      arbitration.degradations.push({
-        node_id: node.id, role: node.role,
-        intended: r.output.primary_intended, used: r.output.provider_used,
-        reason: r.output.degradation.reason,
-        confidence_adj: r.output.degradation.confidence_adjustment,
-      });
-    }
+    if (r?.output?.response) roleText[node.role] = r.output.response;
   }
 
-  // Evidence-weighted synthesis
-  const validResults = nodes
-    .map(n => ({ node: n, r: results[n.id] }))
-    .filter(x => x.r?.output?.response);
+  // Reviewer Alerts
+  let alerts = [];
+  const revText = roleText["reviewer_retriever"] || roleText["reviewer"] || "";
+  const resText = roleText["researcher"] || "";
+  const reaText = roleText["depth_reasoner"] || "";
+  if (revText && (resText || reaText)) {
+    alerts = reviewerAlerts(revText, resText, reaText);
+  }
 
-  // Cross-check for quality/length disparities
-  for (let i = 0; i < validResults.length; i++) {
-    for (let j = i + 1; j < validResults.length; j++) {
-      const a = validResults[i], b = validResults[j];
-      const qa = a.r.quality.quality_score, qb = b.r.quality.quality_score;
-      if (Math.abs(qa - qb) > 0.3) {
-        arbitration.findings.push({
-          type: "quality_disparity",
-          node_a: a.node.id, node_b: b.node.id,
-          score_a: qa, score_b: qb,
-          note: `Quality gap > 0.3 between ${a.node.id}(${qa}) and ${b.node.id}(${qb})`,
-        });
-      }
-      const la = a.r.output.response?.length || 0, lb = b.r.output.response?.length || 0;
-      if (la > 0 && lb > 0 && la > 200 && lb > 200 && (la / lb > 3 || lb / la > 3)) {
-        arbitration.findings.push({
-          type: "length_disparity",
-          node_a: a.node.id, node_b: b.node.id,
-          len_a: la, len_b: lb,
-          note: `Significant response length difference: ${a.node.id}=${la} vs ${b.node.id}=${lb}`,
-        });
-      }
+  // Synthesis Gap
+  let gaps = [];
+  const bldText = roleText["creative_builder"] || "";
+  if (bldText) {
+    const sources = {};
+    if (resText) sources.researcher = resText;
+    if (reaText) sources.reasoner = reaText;
+    if (revText) sources.reviewer = revText;
+    if (Object.keys(sources).length > 0) {
+      gaps = synthesisGap(bldText, sources);
     }
   }
 
-  // Build structured summary
-  const lines = [];
-  lines.push("═".repeat(60));
-  lines.push("EVIDENCE ARBITRATION REPORT");
-  lines.push("═".repeat(60));
-
-  for (const node of nodes) {
-    const r = results[node.id];
-    if (!r?.output?.response) {
-      lines.push(`\n[${node.id}] ${node.role} (${node.ai}): ❌ NO RESULT — ${r?.output?.error || "unknown"}`);
-      continue;
-    }
-    const deg = r.output.degradation;
-    const degNote = deg ? ` ⚠ DEGRADED (${deg.reason}, conf: ${(1 + deg.confidence_adjustment).toFixed(2)})` : "";
-    lines.push(`\n[${node.id}] ${node.role} → ${r.output.provider_used} (quality: ${r.quality.quality_score})${degNote}`);
-    lines.push(`  ${r.output.response.slice(0, 200)}${r.output.response.length > 200 ? "..." : ""}`);
-  }
-
-  if (arbitration.degradations.length > 0) {
-    lines.push(`\n${"─".repeat(60)}`);
-    lines.push("DEGRADATION REPORT:");
-    for (const d of arbitration.degradations) {
-      lines.push(`  [${d.node_id}] ${d.role}: ${d.used || "NONE"} (intended: ${d.intended || d.node_id}) — ${d.reason}`);
-    }
-  }
-
-  const scores = Object.values(results).map(r => r?.quality?.quality_score || 0);
-  arbitration.overall_confidence = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
-  lines.push(`\n${"─".repeat(60)}`);
-  lines.push(`OVERALL CONFIDENCE: ${(arbitration.overall_confidence * 100).toFixed(0)}%`);
-  if (arbitration.findings.length > 0) {
-    lines.push(`FINDINGS: ${arbitration.findings.length} issue(s) flagged`);
-    for (const f of arbitration.findings) lines.push(`  - [${f.type}] ${f.note}`);
-  }
-
-  arbitration.summary = lines.join("\n");
-  return arbitration;
+  return { trust, alerts, gaps };
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// OUTPUT FORMATTER
+// OUTPUT: SYNTHESIS BRIEF + RAW RESPONSES
 // ═══════════════════════════════════════════════════════════════════
 
-function printStructuredOutput(dag, results, arbitration, totalMs) {
-  console.log(`\n${arbitration.summary}`);
+function printStructuredOutput(dag, results, arb, totalMs) {
+  const nodes = dag.nodes;
+
+  // ── Synthesis Brief ──
+  const lines = [];
+  lines.push("═".repeat(60));
+  lines.push("SYNTHESIS BRIEF");
+  lines.push("═".repeat(60));
+
+  // Trust table
+  lines.push("\nTRUST:");
+  for (const node of nodes) {
+    const t = arb.trust[node.id];
+    const label = { FULL: "✓", DEGRADED: "⚠", MISSING: "✗" }[t.tier] || "?";
+    const extras = t.tier === "DEGRADED" ? ` (${t.reason}${t.intended ? ", intended="+t.intended : ""})` : "";
+    lines.push(`  ${label} ${node.id} [${node.role}]: ${t.tier} → ${t.provider || "NONE"}${extras}`);
+  }
+
+  // Reviewer Alerts
+  if (arb.alerts.length > 0) {
+    lines.push("\nREVIEWER ALERTS:");
+    for (const a of arb.alerts) {
+      lines.push(`  ⚡ 指向 ${a.targets.join(" + ")} | ${a.sentence}`);
+    }
+  } else {
+    lines.push("\nREVIEWER ALERTS: (none)");
+  }
+
+  // Synthesis Gaps
+  if (arb.gaps.length > 0) {
+    lines.push("\nSYNTHESIS GAPS:");
+    for (const g of arb.gaps) {
+      lines.push(`  ◇ [${g.from}] ${g.type}: ${g.detail}`);
+    }
+  } else {
+    lines.push("\nSYNTHESIS GAPS: (none — builder 完整覆盖)");
+  }
+
+  // Strategy
+  const degraded = nodes.filter(n => arb.trust[n.id].tier === "DEGRADED");
+  const missing  = nodes.filter(n => arb.trust[n.id].tier === "MISSING");
+  const stratParts = [];
+  if (arb.alerts.length > 0) stratParts.push(`${arb.alerts.length} 项审阅者质疑需核实`);
+  if (arb.gaps.length > 0) stratParts.push(`${arb.gaps.length} 处综合报告缺口需补充`);
+  if (degraded.length > 0) stratParts.push(`${degraded.length} 个角色降级，其输出交叉验证后使用`);
+  if (missing.length > 0) stratParts.push(`${missing.length} 个角色缺失，需自行补充该角度`);
+  if (stratParts.length === 0) stratParts.push("所有角色无降级，综合报告完整，可直接引用");
+  lines.push(`\nSTRATEGY: ${stratParts.join("；")}。`);
+
+  console.log(`\n${lines.join("\n")}`);
   console.log(`\nTotal time: ${(totalMs / 1000).toFixed(1)}s\n`);
 
-  for (const node of dag.nodes) {
+  // ── Raw responses ──
+  for (const node of nodes) {
     const r = results[node.id];
     if (r?.output?.response) {
       console.log(`\n══════ ${node.id} (${node.role}) — ${r.output.provider_used} ══════`);
@@ -578,10 +656,11 @@ async function main() {
   let timeout = 600_000, prompt = "", smoke = false, doctor = false;
 
   for (let i = 0; i < args.length; i++) {
-    if ((args[i] === "--timeout" || args[i].startsWith("--timeout=")) && args[i + 1]) {
-      const v = args[i].startsWith("--timeout=") ? args[i].split("=")[1] : args[i + 1];
-      timeout = parseInt(v, 10);
-      if (!args[i].startsWith("--timeout=")) i++;
+    if (args[i].startsWith("--timeout=")) {
+      timeout = parseInt(args[i].split("=")[1], 10);
+    } else if (args[i] === "--timeout" && args[i + 1]) {
+      timeout = parseInt(args[i + 1], 10);
+      i++;
     } else if (args[i] === "--smoke") smoke = true;
     else if (args[i] === "--doctor") doctor = true;
     else prompt += args[i] + " ";
@@ -620,10 +699,21 @@ async function main() {
 
   if (smoke) {
     log("Smoke test: checking all providers via WebExtended...");
+    const testedLocks = [];
     for (const key of FALLBACK_CHAIN) {
+      // Skip if already locked (provider in use by another worker / already tested)
+      if (!acquireLock(key)) {
+        log(`  ${key}: ⏭ locked (provider in use)`);
+        continue;
+      }
+      testedLocks.push(key);
       const result = await callProvider("Respond with just the word OK.", key, 120000);
       log(`  ${key}: ${result.ok ? `✓ (${result.text.length} chars)` : `✗ ${result.reason}`}`);
+      // Release lock on failure — keep on success so concurrent workers skip it
+      if (!result.ok) { releaseLock(key); testedLocks.pop(); }
     }
+    // Release any remaining locks after test completes
+    for (const k of testedLocks) releaseLock(k);
     process.exit(0);
   }
 

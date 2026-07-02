@@ -1,0 +1,219 @@
+/**
+ * Gemini Model Switcher — ensure Pro Extended Thinking is active.
+ *
+ * v6 (2026-06-28): Fixed Angular CDK overlay rendering delay. After clicking the
+ * model selector button, gem-menu-item elements appear in the DOM immediately but
+ * their innerText is empty for 200-500ms until Angular zone.js finishes change
+ * detection. Playwright's auto-wait only checks visibility, not text content.
+ * Added waitForMenuItemsFilled() to poll innerText until populated.
+ *
+ * This is the CANONICAL implementation — used by WebExtended.
+ * Previously duplicated across two files (~300 lines total).
+ *
+ * Usage:
+ *   const { ensureProExtended } = require('../lib/geminiModelSwitch');
+ *   const ok = await ensureProExtended(page, maxRetries, onLog);
+ */
+
+const MAX_RETRIES = 2;
+
+// Helper: wait for menu items to have actual text content (Angular CDK overlay fix)
+async function waitForMenuItemsFilled(page, timeoutMs = 5000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        const count = await page.evaluate(() => {
+            const items = document.querySelectorAll('gem-menu-item, [role="menuitem"], [role="menuitemradio"]');
+            let filled = 0;
+            for (const el of items) {
+                if ((el.innerText || '').trim().length > 0) filled++;
+            }
+            return filled;
+        });
+        if (count >= 2) return true;
+        await page.waitForTimeout(200);
+    }
+    return false;
+}
+
+/**
+ * Switch Gemini to Pro + Extended Thinking mode. Idempotent — skips if already active.
+ *
+ * @param {Page} page — Playwright page on gemini.google.com
+ * @param {number} [maxRetries=2]
+ * @param {(msg: string) => void} [onLog] — log callback (default: silent)
+ * @returns {Promise<boolean>} true if Pro Extended is active
+ */
+async function ensureProExtended(page, maxRetries = MAX_RETRIES, onLog) {
+    const log = onLog || (() => {});
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        if (attempt > 0) {
+            log(`gemini: retry ${attempt}/${maxRetries} — reloading page`);
+            try {
+                const currentUrl = page.url();
+                await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                await page.waitForTimeout(3000);
+            } catch (_) {}
+        }
+
+        // Dismiss any open overlays
+        await page.keyboard.press('Escape');
+        await page.waitForTimeout(500);
+
+        // Check current mode via aria-label (authoritative, not textContent)
+        const currentAria = await page.evaluate(() => {
+            const btn = document.querySelector(
+                'button[aria-label*="模式挑選器"], button[aria-label*="Model selector"], button[aria-label*="模式选择器"]'
+            );
+            return btn ? (btn.getAttribute('aria-label') || btn.textContent || '').trim() : 'UNKNOWN';
+        });
+        log(`gemini attempt ${attempt}: current mode = "${currentAria}"`);
+
+        if (currentAria.includes('延長') || currentAria.includes('Extended')) {
+            log('gemini: Pro Extended Thinking already active');
+            return true;
+        }
+
+        // Step 1: Open model selector
+        try {
+            const selectorBtn = page.locator(
+                'button[aria-label*="模式挑選器"], button[aria-label*="Model selector"], button[aria-label*="模式选择器"]'
+            ).first();
+            await selectorBtn.waitFor({ state: 'visible', timeout: 5000 });
+            await selectorBtn.click();
+        } catch {
+            log('gemini WARN: Model selector button not found. UI may have changed.');
+            continue;
+        }
+
+        // Wait for menu + Angular CDK overlay to finish rendering text
+        try {
+            await page.locator('[role="menu"]').waitFor({ state: 'visible', timeout: 5000 });
+        } catch {
+            log('gemini WARN: Menu [role="menu"] did not appear. Trying gem-menu-item fallback...');
+        }
+
+        if (!(await waitForMenuItemsFilled(page))) {
+            log('gemini WARN: Menu items never got innerText (Angular CDK rendering timeout).');
+            continue;
+        }
+
+        // Step 2: Ensure Pro model (skip Flash variants)
+        const modeIsPro = currentAria.includes('Pro') && !currentAria.includes('Flash');
+        if (!modeIsPro) {
+            log('gemini: switching to Pro model');
+            try {
+                const proIdx = await page.evaluate(() => {
+                    const items = document.querySelectorAll('gem-menu-item, [role="menuitem"]');
+                    for (let i = 0; i < items.length; i++) {
+                        const t = items[i].innerText || '';
+                        if (t.includes('Pro') && t.includes('進階') && !t.includes('Flash')) return i;
+                    }
+                    return -1;
+                });
+                if (proIdx < 0) throw new Error('Pro item not found');
+
+                await page.locator('gem-menu-item, [role="menuitem"]').nth(proIdx).click();
+                await page.waitForTimeout(2000);
+
+                // Model switch often closes menu — reopen for thinking level
+                const selectorBtn2 = page.locator(
+                    'button[aria-label*="模式挑選器"], button[aria-label*="Model selector"], button[aria-label*="模式选择器"]'
+                ).first();
+                await selectorBtn2.click();
+                await page.locator('[role="menu"]').waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+                if (!(await waitForMenuItemsFilled(page))) {
+                    log('gemini WARN: Menu items after Pro switch never filled.');
+                    continue;
+                }
+            } catch {
+                log('gemini WARN: Failed to switch to Pro model.');
+                continue;
+            }
+        }
+
+        // Step 3: Expand thinking level submenu
+        let extendedIdx = await page.evaluate(() => {
+            const items = document.querySelectorAll('gem-menu-item, [role="menuitem"]');
+            for (let i = 0; i < items.length; i++) {
+                const t = items[i].innerText || '';
+                if ((t.includes('延長') || t.includes('Extended')) &&
+                    !t.includes('思考') && !t.includes('Thought') &&
+                    items[i].offsetParent !== null) {
+                    return i;
+                }
+            }
+            return -1;
+        });
+
+        if (extendedIdx < 0) {
+            log('gemini: expanding thinking-level choices');
+            try {
+                const thinkIdx = await page.evaluate(() => {
+                    const items = document.querySelectorAll('gem-menu-item, [role="menuitem"]');
+                    for (let i = 0; i < items.length; i++) {
+                        const t = items[i].innerText || '';
+                        if ((t.includes('思考程度') || t.includes('Thinking') || t.includes('Thought')) &&
+                            items[i].offsetParent !== null) return i;
+                    }
+                    return -1;
+                });
+                if (thinkIdx < 0) throw new Error('Thinking level item not found');
+
+                await page.locator('gem-menu-item, [role="menuitem"]').nth(thinkIdx).click();
+                await page.waitForTimeout(2000);
+
+                // Re-query: now the L1 "延長" item should be visible
+                extendedIdx = await page.evaluate(() => {
+                    const items = document.querySelectorAll('gem-menu-item, [role="menuitem"]');
+                    for (let i = 0; i < items.length; i++) {
+                        const t = items[i].innerText || '';
+                        if ((t.includes('延長') || t.includes('Extended')) &&
+                            !t.includes('標準') && items[i].offsetParent !== null) return i;
+                    }
+                    return -1;
+                });
+                if (extendedIdx < 0) throw new Error('Extended option not found after expanding');
+            } catch {
+                log('gemini WARN: Could not expand thinking level menu.');
+                continue;
+            }
+        } else {
+            log('gemini: Extended thinking option already visible (partial state handled).');
+        }
+
+        // Step 4: Click Extended
+        try {
+            await page.locator('gem-menu-item, [role="menuitem"]').nth(extendedIdx).click();
+            log('gemini: selected Extended thinking');
+        } catch {
+            log('gemini WARN: Extended button not clickable.');
+            continue;
+        }
+
+        // Step 5: Close menu and verify
+        await page.keyboard.press('Escape');
+        await page.locator('.cdk-overlay-backdrop').waitFor({ state: 'hidden', timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(1000);
+
+        // Verify via aria-label (authoritative source)
+        const isActive = await page.waitForFunction(() => {
+            const btn = document.querySelector(
+                'button[aria-label*="模式挑選器"], button[aria-label*="Model selector"], button[aria-label*="模式选择器"]'
+            );
+            if (!btn) return false;
+            const aria = btn.getAttribute('aria-label') || btn.textContent || '';
+            return aria.includes('延長') || aria.includes('Extended');
+        }, null, { timeout: 5000 }).catch(() => false);
+
+        if (isActive) {
+            log('gemini: Verified Pro Extended Thinking active.');
+            return true;
+        }
+
+        log('gemini: final mode not confirmed as Pro Extended.');
+    }
+    return false;
+}
+
+module.exports = { ensureProExtended, waitForMenuItemsFilled };

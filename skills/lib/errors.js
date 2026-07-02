@@ -17,6 +17,7 @@ const STAGES = Object.freeze({
     NAVIGATE:       'navigate',
     AUTH_CHECK:     'auth_check',
     QUOTA_CHECK:    'quota_check',
+    OVERLAY_CHECK:  'overlay_check',   // modal/dialog blocking editor
     PRE_EDITOR:     'pre_editor',      // e.g., Gemini Pro Extended activation
     EDITOR_FIND:    'editor_find',
     WAIT_RESPONSE:  'wait_response',

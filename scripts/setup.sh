@@ -80,7 +80,7 @@ echo ""
 
 # --- Skill npm 依赖 ---
 echo "📦 Skill npm 依赖:"
-for skill_dir in skills/gemini-web-extended-thinking skills/AgentChat-WebExtended; do
+for skill_dir in skills/AgentChat-WebExtended; do
     if [ -d "$skill_dir" ]; then
         skill_name=$(basename "$skill_dir")
         check "$skill_name node_modules" \

@@ -232,6 +232,7 @@ def launch_browser(p):
         # CRITICAL: prevent Google from detecting automation → CAPTCHA
         "--disable-blink-features=AutomationControlled",
         "--disable-features=HttpsUpgrades,OptimizationHints,Translate",
+        "--disable-quic",
         "--noerrdialogs",
         "--hide-scrollbars",
         "--mute-audio",

@@ -22,9 +22,9 @@ Use this skill when:
 
 Do NOT use for: interactive conversations that need multi-turn context (each provider has independent session state).
 
-**When to use THIS skill vs gemini-web-extended-thinking:**
-- **THIS skill**: Multi-provider with automatic fallback. Use for reliability, batch processing, or when you don't care which AI answers.
-- **gemini-web-extended-thinking**: Gemini-specific, Pro Extended Thinking guaranteed. Use when you need MAX reasoning depth from Gemini.
+**When to use THIS skill**:
+- Multi-provider with automatic fallback. Use for reliability, batch processing, or when you don't care which AI answers.
+- For Gemini-specific Max reasoning depth, use `--from=Gemini` to force Gemini first in the chain.
 
 ---
 
@@ -110,9 +110,8 @@ pgrep -f "start-chrome-debug" || bash scripts/start-chrome-debug.sh
 # 2. CDP 可达
 curl -s http://127.0.0.1:9222/json/version | python3 -c "import json,sys; print(json.load(sys.stdin).get('Browser','FAIL'))"
 
-# 3. playwright-core (npm, ~3MB) — 在各 skill 目录安装
+# 3. playwright-core (npm, ~3MB)
 (cd skills/AgentChat-WebExtended && npm install)
-(cd skills/gemini-web-extended-thinking && npm install)
 
 # 4. 至少一个 AI service 已登录 (Chrome profile 中)
 #    各 service 登录 URL:
@@ -206,23 +205,21 @@ node skills/AgentChat-WebExtended/index.js --from=ChatGPT "prompt"
 index.js
 ├── main()                    — CLI 入口，解析参数
 ├── tryAllProviders()         — 按链遍历 provider，返回第一个成功
-├── providers/ (inline)
-│   ├── tryGemini()           — Gemini Pro Extended (复用已验证的 DOM selector)
-│   ├── tryChatGPT()          — ChatGPT Web
-│   ├── tryClaude()           — Claude Web
-│   ├── tryQwen()             — 通义千问 Web
-│   ├── tryKimi()             — Kimi/月之暗面 Web
-│   ├── tryMiniMax()          — MiniMax Web
-│   ├── tryMiMo()             — 小米 MiMo Studio Web
-│   └── tryDeepSeek()         — DeepSeek Web
+├── RUNNERS (factory-built)   — 8 provider runners via createProviderRunner()
+│   ├── gemini                — config: lib/providers/adapters/gemini.js
+│   ├── chatgpt               — config: lib/providers/adapters/chatgpt.js
+│   ├── claude                — config: lib/providers/adapters/claude.js
+│   ├── qwen                  — config: lib/providers/adapters/qwen.js
+│   ├── kimi                  — config: lib/providers/adapters/kimi.js
+│   ├── minimax               — config: lib/providers/adapters/minimax.js
+│   ├── mimo                  — config: lib/providers/adapters/mimo.js
+│   └── deepseek              — config: lib/providers/adapters/deepseek.js
 ├── helpers/
-│   ├── log() / startTimer()  — 终端输出
-│   ├── connectWithRetry()    — CDP 连接 + 重试
-│   ├── detectAuthRedirect()  — 检测是否跳转到登录页
-│   └── recordTelemetry()     — JSONL telemetry
+│   ├── isProviderTabOpen()   — tab dedup (shared with smokeTest)
+│   ├── log() / startTimer()  — 终端输出 (lib/terminal.js)
+│   └── connectWithRetry()    — CDP 连接 + 重试 (lib/cdp.js)
 └── constants/
-    ├── PROVIDER_CHAIN        — 优先级顺序 + URL
-    └── QUOTA_PATTERNS        — 各 provider 的配额用尽关键词
+    └── PROVIDER_CHAIN        — 优先级顺序 + URL
 ```
 
 ### 核心设计决策
@@ -238,70 +235,34 @@ index.js
 
 ## Provider-Specific Implementation Notes
 
-### Gemini
-- 复用 `gemini-web-extended-thinking` skill 的已验证 DOM selector
-- `ensureProExtended()` 函数逻辑与原始 skill 一致
-- 检测：`contenteditable="false"` → rate limited
+每个 provider 的特殊行为定义在 `lib/providers/adapters/<name>.js` 中（配置驱动，非硬编码），SKILL.md 仅保留关键差异供 AI 调用参考：
 
-### ChatGPT
-- URL: `https://chatgpt.com/`
-- Editor: `[contenteditable="true"][role="textbox"]` 或 `#prompt-textarea`
-- 模型检查：默认使用可用模型，不强制切换（免费用户无模型选择权）
-- 限流检测：页面文本含 "limit" / "quota" / "upgrade"
-- 发送：Enter 键（ChatGPT 的 Angular 与 Gemini 类似）
-
-### Claude
-- URL: `https://claude.ai/`
-- Editor: `[contenteditable="true"]` (ProseMirror)
-- 限流检测：页面文本含 "rate limit" / "exceeded" / "messages remaining"
-- 发送：Enter 或 button[aria-label="Send Message"]
-
-### Qwen (通义千问)
-- URL: `https://www.qianwen.com/?source=tongyigw`
-- Editor: `[contenteditable="true"][role="textbox"]` (Tailwind, 类名 `chat-input-editor` 风格)
-- Send: Enter 键 (没有可识别的 send 按钮类名，全为 Tailwind 通用类)
-- Response: `[class*="message-select-wrapper-answer"]` / `[class*="chat-answers-card-wrap"]`
-- 加载检测: `[class*="loading"][class*="navigator"]`
-- 限流检测：页面含 "额度" / "quota" / "次数"
-- 注意：SPA 需要额外 3s 等待 React 渲染；需去 Qwen3.7-Max 模型名前缀
-
-### Kimi (月之暗面)
-- URL: `https://kimi.moonshot.cn/` (重定向至 `www.kimi.com`)
-- Editor: `[contenteditable="true"][role="textbox"]` (类名 `chat-input-editor`)
-- Send: `div.send-button-container` (输入文字后失去 "disabled" 类名)
-- Response: `[class*="chat-content-item-assistant"]` / `[class*="segment-content"]`
-- 响应检测: 元素计数 (`curCount > oldCount`) + 文本长度增长 (`txtLen > effectiveOldLen`)，**NOT** 字符串相等
-- 新建会话: 每次调用前通过 `page.evaluate()` 点击 `.new-chat-btn`，带 fallback 文本搜索
-- 问候语识别: `oldCount === 1 && oldText.length < 30` → `effectiveOldLen = 0`，避免 Kimi 默认问候语干扰
-- 串行超时: 每 selector 10s（vs 旧版 60s），3 个 selector 最坏 30s
-- 稳定性窗口: 自适应 — `<50 chars → 5s`, `<150 → 30s`, `<500 → 20s`, `<1500 → 15s`, `≥1500 → 8s`
-- 限流检测：页面含 "高峰期算力不足" / "Kimi有点累了" / "聊的人太多了" — 注意限流消息在发送后才出现
-- 注意：SPA 需要额外 4s 等待 React 渲染
-
-### MiniMax
-- URL: `https://agent.minimaxi.com/`
-- Editor: TipTap/ProseMirror `div.tiptap.ProseMirror` (JS 异步挂载，需 `waitForTimeout(4000)`)
-- Send: `<div aria-label="发送消息">`（非 `<button>`）
-- Response: `[class*="message-content"]` / `[class*="matrix-markdown"]`
-- 限流检测：页面含 "额度" / "quota" / "次数"
+| Provider | 关键差异 | 详见 |
+|----------|---------|------|
+| **Gemini** | Pro Extended 强制激活、bursty 输出检测、120s stop-btn 延长、Action Toolbar 完成锚点 | `adapters/gemini.js` |
+| **ChatGPT** | 3 层输入策略 (clipboard→simulated paste→chunked keyboard)、React 发送按钮状态验证 | `adapters/chatgpt.js` |
+| **Claude** | ProseMirror 编辑器、"Thinking" 占位符过滤、嵌入搜索块剥离 | `adapters/claude.js` |
+| **Qwen** | React SPA 3s 延迟、stop-btn detached 模式、模型名前缀剥离 | `adapters/qwen.js` |
+| **Kimi** | 每次调用新建会话、send-button-container disabled 检测、自适应稳定性窗口 (5-30s) | `adapters/kimi.js` |
+| **MiniMax** | TipTap/ProseMirror 异步挂载 4s 延迟、`<div aria-label="发送消息">` 非 button 发送 | `adapters/minimax.js` |
+| **MiMo** | React SPA 4s 延迟、DOM 遍历定位发送按钮 (无可靠 CSS selector) | `adapters/mimo.js` |
+| **DeepSeek** | 标准管线、ds-markdown 响应 | `adapters/deepseek.js` |
 
 ---
 
 ## Adding a New Provider
 
-1. 在 `PROVIDER_CHAIN` 数组中添加 entry
-2. 实现 `try<ProviderName>(page, prompt, timeout)` 函数
-3. 函数返回 `{success: true, response: string}` 或 `{success: false, reason: string}`
-4. `reason` 必须是以下之一: `"quota"` | `"auth"` | `"error"` | `"timeout"`
-   - `"quota"` → 继续降级链
-   - `"auth"` → 继续降级链
-   - `"error"` → 继续降级链
-   - `"timeout"` → 继续降级链
+1. 创建 `lib/providers/adapters/<name>.js` 导出 config 对象（参考现有 adapter）
+2. 在 `PROVIDER_CHAIN` 数组中添加 entry
+3. 在 `PROVIDER_KEYS` 数组中添加 key（自动注册到 RUNNERS）
+4. Config 的关键字段: `url`, `authDomains`, `editorSelectors`, `sendSelectors`/`sendFallback`, `responseSelectors`
+5. 函数返回 `{success: true, response: string}` 或 `{success: false, reason: string}`
+   - `reason` 必须是: `"quota"` | `"auth"` | `"error"` | `"timeout"`
 
 ---
 
 ## Code Location
 
-- `index.js` — 完整实现 (~2370 lines, 8 providers)
+- `index.js` — 完整实现 (~460 lines, 8 providers)
 - `SKILL.md` — this file (AI-facing operational guide)
 - `package.json` — npm metadata (playwright-core)

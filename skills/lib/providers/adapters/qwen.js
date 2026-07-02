@@ -1,0 +1,47 @@
+/**
+ * Qwen (通义千问) provider adapter config.
+ *
+ * Key differences from standard pipeline:
+ *   - React/Tailwind SPA — needs 3s navPostDelay for mount
+ *   - Buttons have Tailwind generic classes — no reliable send selectors
+ *   - Stop button removed from DOM (detached) when done, not just hidden
+ *   - postResponseHook strips model-name prefix (e.g. "Qwen3.7-Max\n")
+ */
+
+module.exports = {
+    key: 'qwen',
+    url: 'https://www.qianwen.com/?source=tongyigw',
+    navPostDelay: 3000, // React-based SPA needs time to mount
+    authDomains: ['qianwen.com/login', 'login.aliyun.com', 'signin.aliyun.com'],
+    quotaPatterns: [
+        /额度.*(?:已|用).*(?:完|尽|满)/i,
+        /quota\s*(?:exceeded|limit)/i,
+        /次数.*(?:已|用).*(?:完|尽)/i,
+        /请.*(?:充值|升级|续费)/i,
+    ],
+    dismissPatterns: [/新功能/i, /欢迎/i, /提示/i, /公告/i, /更新.*说明/i],
+    editorSelectors: [
+        '[contenteditable="true"][role="textbox"]',
+        '[contenteditable="true"]',
+        'textarea',
+        '[role="textbox"]',
+        '[class*="editor"]',
+    ],
+    // Qwen's buttons have Tailwind generic classes — Enter is the only reliable send
+    sendSelectors: [],
+    sendFallback: 'Enter',
+    stopWaitMode: 'detached', // Qwen removes stop button from DOM when done
+    stopSelectors: ['[class*="stop"]', '[class*="pause-generat"]'],
+    responseSelectors: [
+        '[class*="message-select-wrapper-answer"]',
+        '[class*="chat-answers-card-wrap"]',
+        '[class*="message-select-content-inner"]',
+        '[class*="message-select-content"]',
+        '.chat-round.last-message-item',
+    ],
+    responseSelectorTimeout: 60_000,
+    stabilityWindow: 8_000,
+    minResponseLength: 5,
+    postResponseHook: async (_page, text) =>
+        text.replace(/^Qwen[\d.]+-(?:Max|Plus|Turbo|Flash)\s*\n?\s*/i, '').trim(),
+};

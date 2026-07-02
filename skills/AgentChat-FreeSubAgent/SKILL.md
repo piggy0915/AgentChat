@@ -9,7 +9,7 @@
 ## Architecture
 
 ```
-AgentChat-FreeSubAgent (本 skill, ~350 行)
+AgentChat-FreeSubAgent (本 skill, ~630 行)
     │
     │  child_process.spawn('node', ['../AgentChat-WebExtended/index.js', '--from=X', prompt])
     ▼
@@ -75,24 +75,8 @@ Chrome → Gemini / ChatGPT / Claude / Qwen / Kimi / MiniMax / MiMo / DeepSeek
       "primary": "kimi",
       "prompt": "请收集关于...的详细资料和关键数据。用要点列出关键事实。不要运行任何代码。"
     },
-    {
-      "id": "mechanism",
-      "role": "depth_reasoner",
-      "primary": "gemini",
-      "prompt": "请从理论机制层面深入分析...给出严谨推理和明确结论。直接给出完整的分析。"
-    },
-    {
-      "id": "verify",
-      "role": "reviewer_retriever",
-      "primary": "qwen",
-      "prompt": "请通过联网检索验证...直接给出检索结果和验证结论。每个结论标注信息来源。"
-    },
-    {
-      "id": "synthesize",
-      "role": "creative_builder",
-      "primary": "chatgpt",
-      "prompt": "请综合各维度的分析，直接输出完整的决策报告，包含评分矩阵和推荐排名。直接输出完整报告，不要解释方法论。"
-    }
+    // ... 其余 3 个 subtask (mechanism/gemini, verify/qwen, synthesize/chatgpt)
+    // 每个包含 id/role/primary/prompt，prompt 内嵌对应 AI 的指令
   ]
 }
 ```
@@ -136,18 +120,7 @@ FreeSubAgent 层降级链严格遵循 WebExtended 原生顺序，不做优先级
 
 降级结果会显式标记在输出中（provider_used ≠ primary_intended）。
 
-## 验证过的 Provider 状态
-
-| Provider | 状态 | 实现 |
-|----------|------|------|
-| Gemini | ✅ | AgentChat-WebExtended |
-| ChatGPT | ✅ | AgentChat-WebExtended |
-| Claude | ✅ | AgentChat-WebExtended |
-| Qwen | ✅ 已验证 Tailwind DOM | AgentChat-WebExtended |
-| Kimi | ✅ 新增 | AgentChat-WebExtended |
-| MiMo | ⚠ 新增 | AgentChat-WebExtended |
-| MiniMax | ⚠ 可用 | AgentChat-WebExtended |
-| DeepSeek | ⚠ 新增 | AgentChat-WebExtended |
+Provider 可用性由 AgentChat-WebExtended 管理，详见其 SKILL.md。
 
 ## 维护命令
 
@@ -159,20 +132,8 @@ node skills/AgentChat-FreeSubAgent/index.js --smoke
 node skills/AgentChat-FreeSubAgent/index.js --doctor
 ```
 
-## 三模块架构
-
-```
-index.js
-├── M1: buildDAG()            — 调 AI 分解任务为 4 个子 prompt（含 fallback 硬编码 DAG）
-├── M2: dispatchParallel()    — Promise.all 并发 spawn 4 个 WebExtended 子进程
-│       └── runOneWorker()    — 单 worker: callProvider → qualityGate
-│              └── executeWithFallback() — primary → chain 降级
-│                     └── callProvider() — child_process.spawn WebExtended
-└── M3: arbitrateResults()    — 证据仲裁: 质量评分 + 长度差异检测 + 置信度计算
-```
-
 ## Code Location
 
-- `index.js` — 薄编排器 (~350 lines, 零 provider 代码)
+- `index.js` — 薄编排器 (~630 lines, 零 provider 代码)
 - `SKILL.md` — this file
-- Provider 实现 — `../AgentChat-WebExtended/index.js` (单源真相, ~1700 lines)
+- Provider 实现 — `../AgentChat-WebExtended/index.js` (单源真相, ~470 lines)
