@@ -1,3 +1,8 @@
+---
+name: AgentChat-WebExtended
+description: 多Provider CDP桥接, 按优先级链自动降级 (Gemini->ChatGPT->Claude->Qwen->Kimi->MiniMax->MiMo->DeepSeek), 确保始终有一个可用的AI大模型
+---
+
 # AI Fallback Chain — Multi-Provider CDP Bridge
 
 > **最后更新**: 2026-07-03
@@ -173,7 +178,7 @@ node skills/AgentChat-WebExtended/index.js --from=ChatGPT "prompt"
 
 - **stdout**: 成功时输出 AI 响应原文
 - **stderr**: 诊断日志，`[fallback]` 前缀
-- **telemetry**: 写入 `skills/AgentChat-WebExtended/fallback-telemetry.jsonl`
+- **telemetry**: 写入 `skills/AgentChat-WebExtended/data/fallback-telemetry.jsonl`
 
 ```json
 {

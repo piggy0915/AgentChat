@@ -74,7 +74,7 @@ class InvocationContext {
 
     recordTelemetry(code) {
         this.telemetry.exit_code = code;
-        const f = path.join(SKILL_DIR, 'fallback-telemetry.jsonl');
+        const f = path.join(SKILL_DIR, 'data', 'fallback-telemetry.jsonl');
         appendWithRotation(f, JSON.stringify(this.telemetry) + '\n');
     }
 }

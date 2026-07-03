@@ -4,3 +4,5 @@ node_modules/
 /tmp/
 
 *.jsonl
+__pycache__/
+package-lock.json

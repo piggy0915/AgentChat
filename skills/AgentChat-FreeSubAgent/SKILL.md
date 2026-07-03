@@ -1,3 +1,8 @@
+---
+name: AgentChat-FreeSubAgent
+description: 并行 AI 任务分解编排器，Claude Code 拆任务+写 prompt → Node.js 并发派发到 AgentChat-WebExtended → 质量门+证据仲裁
+---
+
 # Parallel AI Decompose — Thin Orchestrator over AgentChat-WebExtended
 
 > **最后更新**: 2026-07-03
