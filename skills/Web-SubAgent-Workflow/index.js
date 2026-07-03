@@ -10,6 +10,7 @@
  *   node index.js --reason "prompt"         # Step 3: Gemini → ChatGPT → Claude
  *   node index.js --review "content"        # Step 5: ChatGPT → Claude → Qwen
  *   node index.js --provider=kimi "prompt"  # Custom single provider
+ *   cat large.txt | node index.js --review  # stdin for large payloads (>32KB)
  *   node index.js --smoke | --doctor
  */
 
@@ -19,8 +20,8 @@ const fs = require("fs");
 const { acquireLock, releaseLock, cleanupAllLocks } = require("../lib/locks");
 
 process.on("exit", cleanupAllLocks);
-process.on("SIGINT", () => { cleanupAllLocks(); process.exit(); });
-process.on("SIGTERM", () => { cleanupAllLocks(); process.exit(); });
+process.on("SIGINT", () => { cleanupAllLocks(); process.exit(130); });
+process.on("SIGTERM", () => { cleanupAllLocks(); process.exit(143); });
 
 // ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -48,9 +49,13 @@ function log(msg) { process.stderr.write(`[workflow] ${msg}\n`); }
 function callProvider(prompt, provider, timeoutMs) {
     return new Promise((resolve) => {
         const child = spawn("node", [
-            WEBEXT, `--from=${provider}`, `--timeout=${timeoutMs}`,
-            "--keep-tabs", "--single", prompt,
-        ], { stdio: ["ignore", "pipe", "pipe"] });
+            WEBEXT, `--only=${provider}`, `--timeout=${timeoutMs}`,
+            `--timeout-per-provider=${timeoutMs}`,
+            "--keep-tabs", "--single",
+        ], { stdio: ["pipe", "pipe", "pipe"] });
+
+        child.stdin.write(prompt);
+        child.stdin.end();
 
         let stdout = "", stderr = "";
         const MAX = 1024 * 1024;
@@ -73,8 +78,8 @@ function callProvider(prompt, provider, timeoutMs) {
             if (code === 0 && text.length >= 5) {
                 resolve({ ok: true, text, provider: providerUsed });
             } else {
-                const m = { 1: "no_cdp", 2: "auth", 3: "safety", 4: "internal", 5: "quota", 9: "all_exhausted", 10: "timeout" };
-                resolve({ ok: false, text: "", provider: providerUsed, reason: m[code] || `exit_${code}` });
+                const m = { 1: "no_cdp", 2: "no_provider", 3: "safety", 4: "internal", 5: "quota", 9: "all_exhausted", 10: "timeout" };
+                resolve({ ok: false, terminal: code === 1, text: "", provider: providerUsed, reason: m[code] || `exit_${code}` });
             }
         });
 
@@ -111,10 +116,14 @@ async function executeWithFallback(chain, prompt, budgetMs) {
     const start = Date.now();
     const tried = [], myLocks = [];
 
-    for (const key of chain) {
+    for (let i = 0; i < chain.length; i++) {
+        const key = chain[i];
         const remaining = budgetMs - (Date.now() - start);
         if (remaining < MIN_CALL_BUDGET_MS) {
-            tried.push({ provider: key, reason: "budget_exhausted" }); break;
+            for (const k of chain.slice(i)) {
+                tried.push({ provider: k, reason: "budget_exhausted" });
+            }
+            break;
         }
         const perCall = Math.min(remaining, PER_CALL_CAP_MS);
 
@@ -125,7 +134,11 @@ async function executeWithFallback(chain, prompt, budgetMs) {
         log(`Trying ${key} (${Math.round(perCall / 1000)}s)...`);
 
         const r = await callProvider(prompt, key, perCall);
+        releaseLock(key);
+
         if (r.ok) {
+            for (const k of myLocks) releaseLock(k);
+            const cleaned = cleanResponse(r.text);
             return {
                 success: true,
                 provider_used: r.provider || key,
@@ -134,13 +147,21 @@ async function executeWithFallback(chain, prompt, budgetMs) {
                     reason: tried.map(t => `${t.provider}:${t.reason}`).join("; "),
                     fallback_chain: tried.map(t => t.provider),
                 } : null,
-                response: cleanResponse(r.text),
-                response_length: cleanResponse(r.text).length,
+                response: cleaned,
+                response_length: cleaned.length,
                 elapsed_ms: Date.now() - start,
             };
         }
+
         tried.push({ provider: key, reason: r.reason || "unknown" });
-        releaseLock(key);
+
+        // no_cdp (exit 1) is fatal for the whole chain — all providers use the same browser
+        if (r.terminal) {
+            for (const k of chain.slice(i + 1)) {
+                tried.push({ provider: k, reason: "skipped_no_cdp" });
+            }
+            break;
+        }
     }
     for (const k of myLocks) releaseLock(k);
     return {
@@ -157,17 +178,23 @@ async function executeWithFallback(chain, prompt, budgetMs) {
 
 async function smokeTest() {
     log("Smoke test...");
-    const tested = [];
-    for (const [step, chain] of Object.entries(STEP_CHAINS)) {
-        for (const key of chain) {
-            if (!acquireLock(key)) { log(`  [${step}] ${key}: ⏭ locked`); continue; }
-            tested.push(key);
-            const r = await callProvider("Respond with exactly: Hello World", key, 120000);
-            log(`  [${step}] ${key}: ${r.ok ? `✓` : `✗ ${r.reason}`}`);
-            if (!r.ok) { releaseLock(key); tested.pop(); }
-        }
+    const seen = new Set();
+    for (const chain of Object.values(STEP_CHAINS)) {
+        for (const key of chain) seen.add(key);
     }
-    for (const k of tested) releaseLock(k);
+
+    const results = [];
+    for (const key of seen) {
+        if (!acquireLock(key)) { log(`  ${key}: ⏭ locked`); results.push(false); continue; }
+        const r = await callProvider("Respond with exactly: Hello World", key, 120000);
+        log(`  ${key}: ${r.ok ? "✓" : "✗ " + r.reason}`);
+        releaseLock(key);
+        results.push(r.ok);
+    }
+    if (results.every(v => !v)) {
+        log("FATAL: all providers failed smoke test");
+        process.exit(2);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -194,11 +221,18 @@ async function main() {
         else if (!a.startsWith("--")) positional.push(a);
     }
 
-    const prompt = positional.join(" ").trim();
+    let prompt = positional.join(" ").trim();
+
+    // Read from stdin when no positional prompt and stdin is piped (supports large payloads)
+    if (!prompt && !process.stdin.isTTY) {
+        try { prompt = fs.readFileSync(0, "utf8").trim(); } catch (_) { /* stdin not readable */ }
+    }
 
     if (doctor) {
-        log(fs.existsSync(WEBEXT) ? `✓ WebExtended: ${WEBEXT}` : `✗ NOT found: ${WEBEXT}`);
-        process.exit(fs.existsSync(WEBEXT) ? 0 : 1);
+        if (!fs.existsSync(WEBEXT)) { log(`✗ NOT found: ${WEBEXT}`); process.exit(1); }
+        const { spawnSync } = require("child_process");
+        const r = spawnSync("node", [WEBEXT, "--doctor"], { stdio: "inherit", timeout: 30000 });
+        process.exit(r.status || (r.error ? 1 : 0));
     }
 
     if (!fs.existsSync(WEBEXT)) { log(`FATAL: WebExtended not found: ${WEBEXT}`); process.exit(1); }
