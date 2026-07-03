@@ -1,19 +1,14 @@
 ---
 name: AgentChat-FreeSubAgent
-description: 并行 AI 任务分解编排器，Claude Code 拆任务+写 prompt → Node.js 并发派发到 AgentChat-WebExtended → 质量门+证据仲裁
+description: Parallel AI task decomposition orchestrator — Claude Code decomposes tasks & writes prompts → Node.js concurrent dispatch to AgentChat-WebExtended → quality gates + evidence arbitration. Use for parallel AI processing, multi-model orchestration, task decomposition, concurrent AI workers, or "ask multiple AIs at once".
 ---
 
 # Parallel AI Decompose — Thin Orchestrator over AgentChat-WebExtended
 
-> **最后更新**: 2026-07-03
+> **最后更新**: 2026-07-04
 > **核心原则**: Claude Code 拆任务 + 写 prompt → Node.js 并发派发 → 质量门 + 证据仲裁
-> **最近修复 (2026-07-03)**:
-> - callProvider() 现在总是带 `--single` 调用 WebExtended，修掉锁定的 provider 和实际使用的 provider 可能不一致的问题
-> - buildDAG() 的 decomposition 预算补上下限保护 (`Math.max(60000, ...)`)，和 dispatchParallel()/executeWithFallback() 的防御模式对齐
-> - SKILL.md 示例命令 `--timeout=900` 单位错误已修正为 `--timeout=900000`（毫秒）
+> **🛡 安全策略**: 永远不关闭用户 Chrome。`--keep-tabs` 硬编码为 true。
 > **Provider 层**: 单一源 — `AgentChat-WebExtended` (8 providers, 零代码重复)
-> **v3 重构**: 删除 ~400 行重复 provider 代码，改为 subprocess 调用 AgentChat-WebExtended
-> **🛡 安全策略 (2026-07-02)**: 永远不关闭用户 Chrome。`browser.close()` 已彻底移除，`--keep-tabs` 硬编码为 true。
 
 ## Architecture
 
@@ -82,10 +77,19 @@ Chrome → Gemini / ChatGPT / Claude / Qwen / Kimi / MiniMax / MiMo / DeepSeek
       "id": "research",
       "role": "researcher",
       "primary": "kimi",
+      "depends_on": [],
       "prompt": "请收集关于...的详细资料和关键数据。用要点列出关键事实。不要运行任何代码。"
     },
-    // ... 其余 3 个 subtask (mechanism/gemini, verify/qwen, synthesize/chatgpt)
-    // 每个包含 id/role/primary/prompt，prompt 内嵌对应 AI 的指令
+    {
+      "id": "analyze",
+      "role": "depth_reasoner",
+      "primary": "gemini",
+      "depends_on": ["research"],
+      "prompt": "基于研究结果，请从理论/机制层面深入分析..."
+    },
+    // ... 其余 subtask (verify/qwen, synthesize/chatgpt)
+    // 每个包含 id/role/primary/depends_on/prompt，prompt 内嵌对应 AI 的指令
+    // depends_on: 字符串数组，列出此任务依赖的其他 subtask id（空数组=无依赖）
   ]
 }
 ```
@@ -149,6 +153,6 @@ node skills/AgentChat-FreeSubAgent/index.js --doctor
 
 ## Code Location
 
-- `index.js` — 薄编排器 (~630 lines, 零 provider 代码)
+- `index.js` — 薄编排器 (零 provider 代码)
 - `SKILL.md` — this file
-- Provider 实现 — `../AgentChat-WebExtended/index.js` (单源真相, ~470 lines)
+- Provider 实现 — `../AgentChat-WebExtended/` (单源真相)

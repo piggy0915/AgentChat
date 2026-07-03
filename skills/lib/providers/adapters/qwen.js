@@ -8,18 +8,15 @@
  *   - postResponseHook strips model-name prefix (e.g. "Qwen3.7-Max\n")
  */
 
+const { COMMON_CN_QUOTA_PATTERNS, COMMON_DISMISS_PATTERNS } = require('../../providerFactory');
+
 module.exports = {
     key: 'qwen',
     url: 'https://www.qianwen.com/?source=tongyigw',
     navPostDelay: 3000, // React-based SPA needs time to mount
     authDomains: ['qianwen.com/login', 'login.aliyun.com', 'signin.aliyun.com'],
-    quotaPatterns: [
-        /额度.*(?:已|用).*(?:完|尽|满)/i,
-        /quota\s*(?:exceeded|limit)/i,
-        /次数.*(?:已|用).*(?:完|尽)/i,
-        /请.*(?:充值|升级|续费)/i,
-    ],
-    dismissPatterns: [/新功能/i, /欢迎/i, /提示/i, /公告/i, /更新.*说明/i],
+    quotaPatterns: [...COMMON_CN_QUOTA_PATTERNS],
+    dismissPatterns: [...COMMON_DISMISS_PATTERNS, /提示/i],
     editorSelectors: [
         '[contenteditable="true"][role="textbox"]',
         '[contenteditable="true"]',

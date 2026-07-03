@@ -258,7 +258,21 @@ function cleanResponse(text) {
 function normalizeAI(name) {
   const n = (name || "").toLowerCase().trim();
   const map = { gpt: "chatgpt", chatgpt: "chatgpt", gemini: "gemini", kimi: "kimi", qwen: "qwen", claude: "claude", minimax: "minimax", deepseek: "deepseek", mimo: "mimo" };
-  return map[n] || n;
+  const key = map[n] || n;
+  // ROBUSTNESS: a decomposer DAG (produced by an external AI) can name an AI
+  // that isn't in our provider set — e.g. "grok", "llama", a typo, or "".
+  // Previously such a key flowed straight through: acquireLock("grok") always
+  // "succeeds" (it's an unused name), then callProvider sends --only=grok to
+  // WebExtended, which USED to silently run Gemini — so this worker held a lock
+  // on "grok" while consuming Gemini, colliding with the real Gemini worker.
+  // Now WebExtended rejects unknown --only, but we still shouldn't waste a
+  // subprocess round-trip on a doomed key: coerce anything unknown to the head
+  // of the chain so the worker at least runs a real, lockable provider.
+  if (!FALLBACK_CHAIN.includes(key)) {
+    log(`WARN: unknown AI "${name}" in DAG node — coercing to "${FALLBACK_CHAIN[0]}"`);
+    return FALLBACK_CHAIN[0];
+  }
+  return key;
 }
 
 const { DAG_DECOMPOSER_PROMPT } = require('../lib/prompts');

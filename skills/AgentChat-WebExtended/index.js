@@ -173,6 +173,23 @@ async function tryAllProviders(browser, prompt, ctx, options = {}) {
             p.key.includes(searchName) || p.name.toLowerCase().includes(searchName)
         );
         if (startIdx === -1) {
+            // ROBUSTNESS: under singleAttempt (--only / --single), silently
+            // resetting to index 0 runs GEMINI while the CALLER believes it ran
+            // the provider it named — and the caller's file lock is held on that
+            // named provider, not Gemini. Two workers then race Gemini with
+            // mismatched locks (exactly the mutual-exclusion break --single was
+            // added to prevent). A misspelled provider must fail loudly, not
+            // impersonate a different one. Only the cascading path (no
+            // singleAttempt) may fall back to starting from the top.
+            if (options.singleAttempt) {
+                const valid = PROVIDER_CHAIN.map(p => p.key).join(', ');
+                log(`ERROR: --only/--single named unknown provider "${options.startFrom}". Valid: ${valid}`);
+                return {
+                    success: false,
+                    reasons: { [options.startFrom]: { reason: 'error',
+                        error_details: { message: `unknown provider: ${options.startFrom}` } } },
+                };
+            }
             log(`WARN: Provider "${options.startFrom}" not found in chain. Starting from beginning.`);
             startIdx = 0;
         } else {

@@ -8,6 +8,8 @@
  *   - postResponseHook rejects truncated opening lines (e.g. "我来从...")
  */
 
+const { COMMON_DISMISS_PATTERNS } = require('../../providerFactory');
+
 module.exports = {
     key: 'kimi',
     url: 'https://kimi.moonshot.cn/',
@@ -20,7 +22,7 @@ module.exports = {
         /前往升级/i,
         /额度.*(?:已|用).*(?:完|尽|满)/i,
     ],
-    dismissPatterns: [/新功能/i, /公告/i, /更新.*日志/i, /版本.*更新/i],
+    dismissPatterns: [...COMMON_DISMISS_PATTERNS, /版本.*更新/i],
 
     // ── Start fresh conversation to avoid stale DOM from previous chats ──
     preInputHook: async (page) => {
@@ -79,6 +81,33 @@ module.exports = {
     responseSelectorTimeout: 60_000,
     stabilityWindow: 8_000,
     minResponseLength: 10,
+
+    // ── Prevent premature "done" during Kimi's multi-round search pauses ──
+    // Kimi's search process: query → pause(5-30s fetch) → analysis → next query → ...
+    // During pauses the text stops growing, which fools the stability poller into
+    // declaring completion. This check resets the stability clock when Kimi is
+    // clearly between search rounds (text ends with a query or result count).
+    stillGeneratingCheck: async (page) => {
+        try {
+            // Use the same selector as responseSelectors[0] for consistency
+            const el = page.locator('[class*="chat-content-item-assistant"]').last();
+            const text = (await el.evaluate(el => el.innerText || el.textContent || '')
+                .catch(() => '')).trim();
+            if (!text || text.length < 50) return false;
+
+            const tail = text.slice(-300);
+            const STILL_SEARCHING = [
+                /搜索[网页关键词资料].*\s*$/,     // ends with a search query line
+                /\d+\s*[个条]\s*结[果].*\s*$/,    // ends with "X 个结果"
+                /让我[再继续].*\s*$/,             // "让我再搜索..."
+                /正在[搜索检索查询].*\s*$/,       // "正在搜索..."
+                /还需[要更].*\s*$/,               // "还需要更多..."
+            ];
+            return STILL_SEARCHING.some(p => p.test(tail));
+        } catch (_) {
+            return false;
+        }
+    },
 
     // ── Reject truncated responses (Kimi occasionally stops mid-sentence) ──
     postResponseHook: async (_page, text) => {

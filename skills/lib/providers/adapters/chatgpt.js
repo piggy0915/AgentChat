@@ -16,7 +16,7 @@
  *   - FIX: changed textarea selector to 'textarea:not(.wcDTda_fallbackTextarea)'
  */
 
-const { inputViaClipboard, inputViaSimulatedPaste, inputViaKeyboard } = require('../../providerFactory');
+const { inputViaClipboard, inputViaSimulatedPaste, inputViaKeyboard, COMMON_DISMISS_PATTERNS } = require('../../providerFactory');
 
 module.exports = {
     key: 'chatgpt',
@@ -33,8 +33,8 @@ module.exports = {
         /额度.*(?:用|已).*尽/i,
     ],
     dismissPatterns: [
-        /what'?s\s*new/i, /new\s*feature/i, /welcome\s*back/i,
-        /try\s*(?:the\s*)?new/i, /introducing/i,
+        ...COMMON_DISMISS_PATTERNS,
+        /welcome\s*back/i,
     ],
     editorSelectors: [
         '#prompt-textarea',                          // ProseMirror div (visible, React-mounted)
@@ -61,7 +61,9 @@ module.exports = {
         'button[aria-label="发送提示"]',              // Chinese locale variant
         'button[aria-label="Send prompt"]',           // English locale variant
         'button[aria-label="Send"]',                  // short English variant
-        'button svg',                                 // last resort (SVG icon inside button)
+        // P1-11: removed 'button svg' — matches ANY button containing an SVG
+        // (new-chat, voice-input, attach-file, etc.), so misclick risk >> benefit.
+        // sendFallback: 'Enter' already covers the case where no selector matches.
     ],
     sendFallback: 'Enter',
     stopSelectors: [

@@ -5,6 +5,7 @@
  */
 
 const fs = require('fs');
+const path = require('path');
 
 const MAX_TELEMETRY_BYTES = 10 * 1024 * 1024; // 10 MB
 const MAX_ROTATIONS = 3;
@@ -17,6 +18,9 @@ const MAX_ROTATIONS = 3;
  * @param {string} line — JSON line to append (include trailing \n)
  */
 function appendWithRotation(filePath, line) {
+    // P1-14: ensure the parent directory exists before writing — otherwise
+    // telemetry is silently lost when data/ hasn't been created yet.
+    try { fs.mkdirSync(path.dirname(filePath), { recursive: true }); } catch (_) {}
     try {
         if (fs.existsSync(filePath) && fs.statSync(filePath).size > MAX_TELEMETRY_BYTES) {
             // Shift rotations: .2→.3, .1→.2, file→.1

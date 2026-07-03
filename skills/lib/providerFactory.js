@@ -403,10 +403,22 @@ async function waitForCompletion(page, config, startTime, timeoutMs) {
     let lastChangeTime = Date.now();
     const deadline = startTime + timeoutMs;
 
+    // ROBUSTNESS: distinguish a transient read miss (element re-rendered mid-poll)
+    // from a fatal page loss (tab crashed, navigated away, browser context gone).
+    // The old blanket `catch { tick('?') }` treated BOTH as transient and kept
+    // polling a dead page until the FULL timeoutMs elapsed — turning a 2s crash
+    // into a 180s hang and burning the whole provider budget on nothing. We now
+    // count consecutive errors and, if the page itself is closed/crashed, break
+    // immediately and return whatever text we captured before the failure.
+    let consecutiveErrors = 0;
+    const MAX_CONSECUTIVE_ERRORS = 5;
     while ((Date.now() - lastChangeTime) < stabilityWindow && Date.now() < deadline) {
         await page.waitForTimeout(pollInterval);
+        // Fast path out: page/context gone → no point polling further.
+        if (page.isClosed()) { tick('?'); break; }
         try {
             const text = await responseEl.evaluate(el => el.innerText || el.textContent || '');
+            consecutiveErrors = 0;
 
             // Check if generation is still in progress (e.g. bursty Pro Extended output)
             const stillGen = await stillGeneratingCheck(page).catch(() => false);
@@ -421,7 +433,18 @@ async function waitForCompletion(page, config, startTime, timeoutMs) {
             } else {
                 tick('.');
             }
-        } catch { tick('?'); }
+        } catch (e) {
+            tick('?');
+            // A crashed/navigated page throws "Target closed" / "Execution context
+            // was destroyed" on every subsequent evaluate — retrying can't recover.
+            const msg = String(e && e.message || e);
+            if (/Target.*closed|context was destroyed|has been closed|crashed/i.test(msg)) {
+                break;
+            }
+            // Otherwise treat as transient, but cap the run of failures so a
+            // permanently-detached responseEl can't spin to the deadline either.
+            if (++consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) break;
+        }
     }
 
     // Phase 4 (optional): completion anchor — definitive "done" signal

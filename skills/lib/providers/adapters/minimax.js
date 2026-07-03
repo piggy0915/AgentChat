@@ -6,18 +6,15 @@
  *   - Send trigger is <div aria-label="发送消息"> (non-button element)
  */
 
+const { COMMON_CN_QUOTA_PATTERNS, COMMON_DISMISS_PATTERNS } = require('../../providerFactory');
+
 module.exports = {
     key: 'minimax',
     url: 'https://agent.minimaxi.com/',
     navPostDelay: 4000, // TipTap/ProseMirror mounts async
     authDomains: ['agent.minimaxi.com/login', 'minimax.com/login'],
-    quotaPatterns: [
-        /额度.*(?:已|用).*(?:完|尽|满)/i,
-        /quota\s*(?:exceeded|limit)/i,
-        /次数.*(?:已|用).*(?:完|尽)/i,
-        /请.*(?:充值|升级)/i,
-    ],
-    dismissPatterns: [/新功能/i, /公告/i, /欢迎/i, /更新.*说明/i],
+    quotaPatterns: [...COMMON_CN_QUOTA_PATTERNS],
+    dismissPatterns: [...COMMON_DISMISS_PATTERNS],
     editorSelectors: [
         '[class*="ProseMirror"]', '[class*="tiptap"]', 'textarea',
         '[contenteditable="true"]', '[role="textbox"]', '[class*="editor"]',

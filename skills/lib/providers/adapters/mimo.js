@@ -7,18 +7,18 @@
  *   - customSend overrides the factory's default clickSend
  */
 
+const { COMMON_CN_QUOTA_PATTERNS, COMMON_DISMISS_PATTERNS } = require('../../providerFactory');
+
 module.exports = {
     key: 'mimo',
     url: 'https://aistudio.xiaomimimo.com/',
     navPostDelay: 4000, // React/Tailwind SPA render
     authDomains: ['aistudio.xiaomimimo.com/login', 'auth0.com'],
     quotaPatterns: [
-        /额度.*(?:已|用).*(?:完|尽|满)/i,
-        /quota\s*(?:exceeded|limit)/i,
+        ...COMMON_CN_QUOTA_PATTERNS,
         /免费版.*升级/i,
-        /请.*(?:充值|升级|续费)/i,
     ],
-    dismissPatterns: [/welcome/i, /what'?s\s*new/i, /新功能/i, /公告/i],
+    dismissPatterns: [...COMMON_DISMISS_PATTERNS],
     editorSelectors: [
         'textarea[placeholder*="有问题，尽管问"]',
         'textarea[placeholder*="Shift + Enter"]',

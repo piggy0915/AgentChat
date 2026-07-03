@@ -4,18 +4,18 @@
  * Standard pipeline with DeepSeek-specific DOM selectors.
  */
 
+const { COMMON_CN_QUOTA_PATTERNS, COMMON_DISMISS_PATTERNS } = require('../../providerFactory');
+
 module.exports = {
     key: 'deepseek',
     url: 'https://chat.deepseek.com/',
     navPostDelay: 3000,
     authDomains: ['chat.deepseek.com/login', 'deepseek.com/login'],
     quotaPatterns: [
-        /额度.*(?:已|用).*(?:完|尽|满)/i,
-        /quota\s*(?:exceeded|limit)/i,
+        ...COMMON_CN_QUOTA_PATTERNS,
         /rate\s*limit/i,
-        /请.*(?:充值|升级)/i,
     ],
-    dismissPatterns: [/新功能/i, /更新/i, /公告/i],
+    dismissPatterns: [...COMMON_DISMISS_PATTERNS],
     editorSelectors: [
         'textarea[placeholder*="给 DeepSeek 发送消息"]',
         'textarea[placeholder*="DeepSeek"]',

@@ -55,14 +55,25 @@ async function isStillGenerating(page) {
 }
 
 /** Check if text looks like pre-generation filler (search queries, thinking, etc.) */
+// P1-10: consecutive unchanged rounds counter — prevents infinite stability-clock
+// resets for short, valid answers (e.g. "42", single-word responses) that lack
+// punctuation. Without this guard, `stillGeneratingCheck` keeps returning true,
+// resetting the stability clock every cycle until the full Gemini budget burns out.
+let _preGenStreak = 0;
+const MAX_PREGEN_STREAK = 8; // ~16s at default 2s poll interval
+
 function looksLikePreGeneration(text) {
     const trimmed = (text || '').trim();
-    if (trimmed.length === 0) return true;
-    if (trimmed.length > 300) return false;
+    if (trimmed.length === 0) { _preGenStreak++; return _preGenStreak <= MAX_PREGEN_STREAK; }
+    if (trimmed.length > 300) { _preGenStreak = 0; return false; }
     for (const pat of STILL_WORKING_TEXT) {
-        if (pat.test(trimmed)) return true;
+        if (pat.test(trimmed)) { _preGenStreak++; return _preGenStreak <= MAX_PREGEN_STREAK; }
     }
-    if (trimmed.length < 150 && !/[。！？\.!\?;；，\n]{1}/.test(trimmed)) return true;
+    if (trimmed.length < 150 && !/[。！？\.!\?;；，\n]{1}/.test(trimmed)) {
+        _preGenStreak++;
+        return _preGenStreak <= MAX_PREGEN_STREAK; // eventually accept as final
+    }
+    _preGenStreak = 0;
     return false;
 }
 

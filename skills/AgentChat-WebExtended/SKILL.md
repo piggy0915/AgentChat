@@ -1,26 +1,13 @@
 ---
 name: AgentChat-WebExtended
-description: 多Provider CDP桥接, 按优先级链自动降级 (Gemini->ChatGPT->Claude->Qwen->Kimi->MiniMax->MiMo->DeepSeek), 确保始终有一个可用的AI大模型
+description: Multi-provider CDP bridge with automatic fallback (Gemini->ChatGPT->Claude->Qwen->Kimi->MiniMax->MiMo->DeepSeek). Use for AI provider failover, fallback chain, multi-provider routing, or "send to any available AI".
 ---
 
 # AI Fallback Chain — Multi-Provider CDP Bridge
 
-> **最后更新**: 2026-07-03
+> **最后更新**: 2026-07-04
 > **核心功能**: 按优先级链自动降级，确保始终有一个可用的大模型
-> **最近修复**:
-> - 新增 `--single` flag: 只尝试单个 provider 不级联，供 FreeSubAgent 的跨 worker 锁使用
-> - checkOverlays(): 修掉一处死三元表达式 (`dismissable ? 'error' : 'error'`)
-> - waitForCompletion() 的 stopWaitMode='detached' 分支 (Qwen): 补上已耗时间扣减，避免单 provider 超预算
-> - Claude adapter postResponseHook: 去掉与 minResponseLength:5 矛盾的 30 字符门槛，短回答不再被误杀
-> - telemetry.js 日志轮转 off-by-one: `.2` 之前会被静默覆盖丢失，现在能正确落到 `.3`
-> - Kimi 响应检测: 字符串相等比较 → 元素计数+文本长度增长, 修复同文本不匹配 bug
-> - Kimi 新建会话: 每次调用前点击 `.new-chat-btn` 清空旧 DOM, 避免检测干扰
-> - Kimi 问候语识别: `oldCount===1 && oldText<30chars` → 视为空白页
-> - Kimi 稳定性窗口: 自适应 (5s/30s/20s/15s/8s), 短文不再等 30s
-> - Kimi 串行超时: selector 60s → 10s each, 45s 最坏 → 30s
-> - Gemini Pro Extended 长 prompt 超时: stop button 可见=仍在思考, 延长等待+120s
-> - Claude "Thinking" 占位符: 过滤 Thinking/Analyzing 空响应, 多重停止检测
-> - Promise.allSettled: FreeSubAgent 单 worker 异常不再影响其他 worker
+> **变更日志**: 见 [CHANGELOG.md](CHANGELOG.md)
 
 ## Trigger
 
@@ -41,37 +28,11 @@ Do NOT use for: interactive conversations that need multi-turn context (each pro
 ## Fallback Chain (Priority Order)
 
 ```
-┌──────────┐    quota/Pro不可用    ┌──────────┐    quota用尽    ┌──────────┐
-│  Gemini  │ ───────────────────→ │ ChatGPT  │ ──────────────→ │  Claude  │
-│ Pro延長  │                      │  (Web)   │                 │  (Web)   │
-└────┬─────┘                      └────┬─────┘                 └────┬─────┘
-     │ 成功                            │ 成功                       │ 成功
-     ▼                                 ▼                           ▼
-  返回结果                          返回结果                     返回结果
-
-     quota用尽    ┌──────────┐    quota用尽    ┌──────────┐    quota用尽    ┌──────────┐
-  ──────────────→ │   Qwen   │ ──────────────→ │   Kimi   │ ──────────────→ │ MiniMax  │
-                  │ (通义千问) │                 │ (月之暗面) │                 │          │
-                  └────┬─────┘                 └────┬─────┘                 └────┬─────┘
-                       │ 成功                       │ 成功                       │ 成功
-                       ▼                            ▼                            ▼
-                    返回结果                     返回结果                     返回结果
-
-     quota用尽    ┌──────────┐    quota用尽    ┌──────────┐
-  ──────────────→ │   MiMo   │ ──────────────→ │ DeepSeek │
-                  │ (小米)    │                 │          │
-                  └────┬─────┘                 └────┬─────┘
-                       │ 成功                       │ 成功
-                       ▼                            ▼
-                    返回结果                     返回结果
-
-  全部不可用 → ERR_ALL_EXHAUSTED (exit code 9)
+Gemini → ChatGPT → Claude → Qwen → Kimi → MiniMax → MiMo → DeepSeek
+(Pro Extended)                                                  (last resort)
 ```
 
-**核心规则**:
-- 每次调用**只使用一个** provider — 第一个可用的就返回
-- 只有确认当前 provider 不可用（quota 用尽/模型不可用/未登录）时才降级
-- 不会因为网络瞬断就跳过 — 每个 provider 有独立的重试逻辑
+First available provider wins. Each step falls through ONLY on confirmed unavailability (quota/auth/model-degraded), never on transient network errors.
 
 ---
 
@@ -87,19 +48,13 @@ Do NOT use for: interactive conversations that need multi-turn context (each pro
 
 ### Gemini 特殊处理
 Gemini 是 chain 中唯一要求 **Pro Extended Thinking** 的 provider。
-如果 Pro Extended 无法激活（ERR_MODEL_DEGRADED），直接降级到 ChatGPT，
-**绝不**使用 Gemini Flash 模式。
+模型激活分三层降级：
+1. **Pro Extended Thinking**（需 Gemini Pro 订阅）— 首选
+2. **Flash 模式**（免费 tier 兜底）— Pro Extended 不可用时自动切换
+3. 两者都失败 → `ERR_MODEL_DEGRADED`，降级到 ChatGPT
 
-### 各 Provider 降级触发条件
-
-| Provider | 降级条件 |
-|----------|---------|
-| **Gemini** | ① rate-limit (editor locked) ② Pro Extended 激活失败 ③ 未登录 |
-| **ChatGPT** | ① "达到限额" ② "Upgrade to Plus" ③ 输入框只读 ④ 未登录 |
-| **Claude** | ① "Rate limit exceeded" ② "out of messages" ③ 未登录 |
-| **Qwen** | ① 输入框不可编辑 ② 配额提示 ③ 未登录 |
-| **Kimi** | ① "高峰期算力不足" ② "Kimi有点累了" ③ 未登录 |
-| **MiniMax** | ① 输入框不可编辑 ② 配额提示 ③ 未登录 |
+降级触发条件由各 adapter 的 `quotaPatterns` 定义（`lib/providers/adapters/<name>.js`），
+是权威来源。SKILL.md 不再维护第二份副本（过去已出现与代码不一致的漂移）。
 
 ---
 
@@ -201,7 +156,7 @@ node skills/AgentChat-WebExtended/index.js --from=ChatGPT "prompt"
 |------|------|---------|
 | 0 | — | Success — response on stdout |
 | 1 | `ERR_NO_CDP` | Chrome CDP 端口不可达 |
-| 2 | `ERR_NO_PROVIDER` | 所有 provider 不可用 (未登录/页面加载失败) |
+| 2 | `ERR_NO_PROVIDER` | 所有 provider 不可用 (全部未登录/需认证) |
 | 3 | `ERR_SAFETY_REJECTED` | 当前 provider 安全过滤拒绝 (已尝试所有) |
 | 4 | `ERR_INTERNAL` | 内部错误 (Node 异常、CDP 断开等) |
 | 5 | `ERR_RATE_LIMITED` | 所有 provider 均被限流 |
@@ -274,6 +229,9 @@ index.js
 
 ## Code Location
 
-- `index.js` — 完整实现 (~460 lines, 8 providers)
-- `SKILL.md` — this file (AI-facing operational guide)
+- `index.js` — CLI 入口 + fallback 编排器
+- `lib/providerFactory.js` — 10-step config-driven pipeline (所有 8 个 provider 共享)
+- `lib/providers/adapters/<name>.js` — 各 provider 差异配置
+- `lib/providers/chain.js` — 优先级顺序 (与 FreeSubAgent 共享的单一真相源)
+- `SKILL.md` — AI-facing operational guide
 - `package.json` — npm metadata (playwright-core)

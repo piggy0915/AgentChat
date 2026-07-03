@@ -7,6 +7,8 @@
  *   - postResponseHook strips "Thinking" placeholder + embedded search-result blocks
  */
 
+const { COMMON_DISMISS_PATTERNS } = require('../../providerFactory');
+
 module.exports = {
     key: 'claude',
     url: 'https://claude.ai/',
@@ -22,8 +24,8 @@ module.exports = {
         /please\s*wait\s*(?:\d+|a few|until|before\s+sending)/i,
     ],
     dismissPatterns: [
-        /what'?s\s*new/i, /new\s*feature/i, /try\s*(?:the\s*)?new/i,
-        /introducing/i, /welcome/i, /announcement/i,
+        ...COMMON_DISMISS_PATTERNS,
+        /announcement/i,
     ],
     editorSelectors: [
         '[contenteditable="true"]',
