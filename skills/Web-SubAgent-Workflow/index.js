@@ -14,7 +14,6 @@
  *   node index.js --smoke | --doctor
  */
 
-const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const { acquireLock, releaseLock, cleanupAllLocks } = require("../lib/locks");
@@ -37,141 +36,30 @@ const STEP_CHAINS = {
     review: ["chatgpt", "claude", "qwen"],
 };
 
-const PER_CALL_CAP_MS = 180_000;
-const MIN_CALL_BUDGET_MS = 20_000;
-
 function log(msg) { process.stderr.write(`[workflow] ${msg}\n`); }
 
 // ═══════════════════════════════════════════════════════════════════
-// PROVIDER CALL — subprocess → WebExtended
+// PROVIDER CALL + FALLBACK — shared executor (lib/execute.js)
 // ═══════════════════════════════════════════════════════════════════
+// callProvider/cleanResponse/executeWithFallback previously lived here as a
+// near-copy of FreeSubAgent's versions and had drifted (exit code 2 was
+// labelled "no_provider" here vs "auth" there; MIN_CALL_BUDGET 20s vs 30s).
+// Single implementation now, parameterized:
+//   holdLockOnSuccess: false — steps are sequential; a provider is free again
+//     the moment its call returns.
+//   minCallBudgetMs: 20s — preserves this skill's previous chain-stop threshold.
+// The executor also unifies stdin prompt delivery and the no_cdp terminal abort
+// this skill already had.
 
-function callProvider(prompt, provider, timeoutMs) {
-    return new Promise((resolve) => {
-        const child = spawn("node", [
-            WEBEXT, `--only=${provider}`, `--timeout=${timeoutMs}`,
-            `--timeout-per-provider=${timeoutMs}`,
-            "--keep-tabs", "--single",
-        ], { stdio: ["pipe", "pipe", "pipe"] });
+const { createExecutor } = require("../lib/execute");
+const { callProvider, runChain, cleanResponse } = createExecutor({
+    webextPath: WEBEXT,
+    logPrefix: "workflow",
+    minCallBudgetMs: 20_000,
+    holdLockOnSuccess: false,
+});
 
-        child.stdin.on("error", () => { /* EPIPE: child exited before stdin drained */ });
-        try { child.stdin.write(prompt); } catch (_) { /* child already gone */ }
-        try { child.stdin.end(); } catch (_) { /* child already gone */ }
-
-        let stdout = "", stderr = "";
-        const MAX = 1024 * 1024;
-        child.stdout.on("data", d => { if (stdout.length < MAX) stdout += d.toString(); });
-        child.stderr.on("data", d => { if (stderr.length < MAX) stderr += d.toString(); });
-
-        let settled = false;
-        const t1 = setTimeout(() => {
-            if (!settled) { log(`SIGTERM → ${provider}`); child.kill("SIGTERM"); }
-        }, timeoutMs + 30000);
-        const t2 = setTimeout(() => {
-            if (!settled) { log(`SIGKILL → ${provider}`); child.kill("SIGKILL"); }
-        }, timeoutMs + 35000);
-
-        child.on("close", (code) => {
-            settled = true; clearTimeout(t1); clearTimeout(t2);
-            const text = stdout.trim();
-            const usedMatch = stderr.match(/✓\s*(\w+):\s*USED/);
-            const providerUsed = usedMatch ? usedMatch[1].toLowerCase() : provider;
-            if (code === 0 && text.length >= 5) {
-                resolve({ ok: true, text, provider: providerUsed });
-            } else {
-                const m = { 1: "no_cdp", 2: "no_provider", 3: "safety", 4: "internal", 5: "quota", 9: "all_exhausted", 10: "timeout" };
-                resolve({ ok: false, terminal: code === 1, text: "", provider: providerUsed, reason: m[code] || `exit_${code}` });
-            }
-        });
-
-        child.on("error", (err) => {
-            settled = true; clearTimeout(t1); clearTimeout(t2);
-            resolve({ ok: false, text: "", provider, reason: "spawn_error", error: err.message });
-        });
-    });
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// RESPONSE CLEANING
-// ═══════════════════════════════════════════════════════════════════
-
-const UI_CHROME = [
-    /^Gemini\s*[说說了]?[：:\s]*/gim, /^Claude\s*responded[：:\s]*/gim,
-    /^ChatGPT\s*said[：:\s]*/gim, /^Kimi\s*说[：:\s]*/gim,
-    /Thought\s*for\s*\d+s?\s*/gi, /^You said[：:\s]*.*?\n/gim,
-    /^[^\n，,]{1,12}[，,]\s*(?:接著要做什麼|接下来要做什么|在想什麼|在想什么|我們進入正題|我们进入正题)[^\n]*/gim,
-    /^我隨時待命[！!。.]?\s*/gim, /^我随时待命[！!。.]?\s*/gim,
-];
-
-function cleanResponse(text) {
-    let c = text || "";
-    for (const p of UI_CHROME) c = c.replace(p, "");
-    return c.trim();
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// FALLBACK EXECUTOR
-// ═══════════════════════════════════════════════════════════════════
-
-async function executeWithFallback(chain, prompt, budgetMs) {
-    const start = Date.now();
-    const tried = [], myLocks = [];
-
-    for (let i = 0; i < chain.length; i++) {
-        const key = chain[i];
-        const remaining = budgetMs - (Date.now() - start);
-        if (remaining < MIN_CALL_BUDGET_MS) {
-            for (const k of chain.slice(i)) {
-                tried.push({ provider: k, reason: "budget_exhausted" });
-            }
-            break;
-        }
-        const perCall = Math.min(remaining, PER_CALL_CAP_MS);
-
-        if (!acquireLock(key)) {
-            tried.push({ provider: key, reason: "locked" }); continue;
-        }
-        myLocks.push(key);
-        log(`Trying ${key} (${Math.round(perCall / 1000)}s)...`);
-
-        const r = await callProvider(prompt, key, perCall);
-        releaseLock(key);
-
-        if (r.ok) {
-            for (const k of myLocks) releaseLock(k);
-            const cleaned = cleanResponse(r.text);
-            return {
-                success: true,
-                provider_used: r.provider || key,
-                primary_intended: chain[0],
-                degradation: r.provider !== chain[0] ? {
-                    reason: tried.map(t => `${t.provider}:${t.reason}`).join("; "),
-                    fallback_chain: tried.map(t => t.provider),
-                } : null,
-                response: cleaned,
-                response_length: cleaned.length,
-                elapsed_ms: Date.now() - start,
-            };
-        }
-
-        tried.push({ provider: key, reason: r.reason || "unknown" });
-
-        // no_cdp (exit 1) is fatal for the whole chain — all providers use the same browser
-        if (r.terminal) {
-            for (const k of chain.slice(i + 1)) {
-                tried.push({ provider: k, reason: "skipped_no_cdp" });
-            }
-            break;
-        }
-    }
-    for (const k of myLocks) releaseLock(k);
-    return {
-        success: false, provider_used: null, primary_intended: chain[0],
-        degradation: { reason: "ALL_EXHAUSTED", attempted: tried },
-        response: null, error: `All exhausted: ${tried.map(t => t.provider).join(", ")}`,
-        elapsed_ms: Date.now() - start,
-    };
-}
+const executeWithFallback = runChain; // (chain, prompt, budgetMs)
 
 // ═══════════════════════════════════════════════════════════════════
 // SMOKE TEST

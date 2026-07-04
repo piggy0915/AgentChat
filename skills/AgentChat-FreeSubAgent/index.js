@@ -11,12 +11,16 @@
  *   6. Single provider source: AgentChat-WebExtended (no code duplication)
  *
  * Three modules:
- *   M1: Task DAG — decompose task into 4 complementary sub-prompts
- *   M2: Parallel Dispatch — spawn N subprocesses, each → AgentChat-WebExtended
+ *   M1: Task DAG — decompose task into complementary sub-prompts
+ *   M2: Wave Dispatch — topological layers (depends_on honored); nodes within a
+ *       wave run as parallel subprocesses → AgentChat-WebExtended, downstream
+ *       prompts receive upstream outputs ({{dep_id}} substitution or appendix)
  *   M3: Evidence Arbitrator — evidence-weighted synthesis + degradation report
+ *
+ * Provider subprocess plumbing lives in lib/execute.js (shared with
+ * Web-SubAgent-Workflow); prompts travel over stdin, never argv.
  */
 
-const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 
@@ -43,10 +47,6 @@ function buildFallbackChain(primaryKey, skipList = []) {
 
 const STAGGER_MS = 1500; // inter-worker launch delay
 
-// Module-level flags set by main()
-// POLICY: Always keep tabs. Never let subprocesses close the user's browser.
-const KEEP_TABS = true;
-
 // ═══════════════════════════════════════════════════════════════════
 // UTILS
 // ═══════════════════════════════════════════════════════════════════
@@ -56,199 +56,32 @@ const log = (msg) => _log('orch', msg);
 function ts() { return new Date().toISOString().slice(11, 19); }
 
 // ═══════════════════════════════════════════════════════════════════
-// PROVIDER CALL — single subprocess → AgentChat-WebExtended
+// PROVIDER CALL — shared executor (lib/execute.js)
 // ═══════════════════════════════════════════════════════════════════
+// callProvider/runChain/cleanResponse previously lived here as a near-copy of
+// Web-SubAgent-Workflow's versions and had already drifted (exit-code labels,
+// MIN_CALL_BUDGET). Now a single implementation, parameterized:
+//   holdLockOnSuccess: true — a successful provider stays locked so other
+//     workers IN THE SAME WAVE skip it (tab-collision protection). Locks are
+//     released at wave boundaries by dispatchWaves(), and on process exit.
+//   acceptUsedMarker: true — tolerate the stdout/close delivery race by
+//     trusting WebExtended's "✓ X: USED (N chars" stderr marker.
+// Prompt delivery is now stdin (was argv): required for wave execution, which
+// injects upstream outputs into downstream prompts — argv would hit Windows'
+// ~32KB command-line limit and leak prompts via `ps`.
 
-/**
- * Call a single AI provider via AgentChat-WebExtended subprocess.
- * All provider implementation lives in WebExtended — this is just a thin wrapper.
- *
- * @returns {{ ok: boolean, text: string, provider: string, reason?: string }}
- */
-function callProvider(prompt, provider, timeoutMs) {
-  return new Promise((resolve) => {
-    const spawnArgs = [
-      WEBEXT,
-      `--from=${provider}`,
-      `--timeout=${timeoutMs}`,
-      `--timeout-per-provider=${timeoutMs}`,
-    ];
-    spawnArgs.push("--keep-tabs"); // Always — never let child process close tabs
-    // BUGFIX: without --single, WebExtended's --from only sets the starting index —
-    // on failure it cascades through the REST of its own PROVIDER_CHAIN inside this
-    // one subprocess. That meant `provider` (the key we acquireLock()'d above) could
-    // silently differ from the provider actually used, while the lock stayed on
-    // `provider` — breaking mutual exclusion between concurrent DAG-node workers
-    // that expect exclusive use of whatever provider ends up handling their call.
-    // --single makes this an atomic "exactly this one provider" attempt, so our own
-    // executeWithFallback() loop (with its own locking) is the sole fallback layer.
-    spawnArgs.push("--single");
-    spawnArgs.push(prompt);
+const { createExecutor } = require('../lib/execute');
+const { callProvider, runChain, cleanResponse } = createExecutor({
+    webextPath: WEBEXT,
+    logPrefix: 'orch',
+    minCallBudgetMs: 30_000,
+    holdLockOnSuccess: true,
+    acceptUsedMarker: true,
+});
 
-    const child = spawn("node", spawnArgs, {
-      stdio: ["ignore", "pipe", "pipe"],
-      // P0-4: Removed built-in timeout (SIGTERM only, no SIGKILL fallback).
-      // Using explicit dual-timer instead to prevent zombie processes.
-    });
-
-    let stdout = "", stderr = "";
-    const MAX_BUFFER = 1024 * 1024; // 1MB to prevent OOM (P1 extra safety)
-    let truncated = false;
-
-    child.stdout.on("data", d => {
-      if (stdout.length < MAX_BUFFER) stdout += d.toString();
-      else truncated = true;
-    });
-    child.stderr.on("data", d => {
-      if (stderr.length < MAX_BUFFER) stderr += d.toString();
-      else truncated = true;
-    });
-
-    let settled = false;
-    const sigtermTime = timeoutMs + 30000;
-    const sigkillTime = sigtermTime + 5000;
-
-    // P0-4: SIGTERM first, then SIGKILL to prevent zombie processes
-    const sigtermTimer = setTimeout(() => {
-      if (!settled) { log(`    [orch] SIGTERM -> ${provider} (actual elapsed ${sigtermTime}ms, call budget ${timeoutMs}ms)`); child.kill('SIGTERM'); }
-    }, sigtermTime);
-
-    const sigkillTimer = setTimeout(() => {
-      if (!settled) { log(`    [orch] SIGKILL -> ${provider} (forced after ${sigkillTime}ms total)`); child.kill('SIGKILL'); }
-    }, sigkillTime);
-
-    child.on("close", (code) => {
-      settled = true;
-      clearTimeout(sigtermTimer);
-      clearTimeout(sigkillTimer);
-
-      const text = stdout.trim();
-      const provMatch = stderr.match(/✓\s*(\w+):\s*USED/);
-      const providerUsed = provMatch ? provMatch[1].toLowerCase() : provider;
-
-      if (truncated) {
-        log(`    [orch] WARN: Output truncated for ${provider} (exceeded 1MB buffer)`);
-      }
-
-      // P0-5: If WebExtended logged "✓ Provider: USED" to stderr, trust it.
-      // Concurrent subprocesses can race stdout delivery vs close event.
-      const usedMatch = stderr.match(/✓\s*(\w+):\s*USED\s*\((\d+)\s*chars/);
-      if (code === 0 && (text.length >= 5 || usedMatch)) {
-        resolve({ ok: true, text, provider: providerUsed });
-      } else {
-        const reasonMap = { 1: "no_cdp", 2: "auth", 3: "safety", 4: "internal", 5: "quota", 9: "all_exhausted", 10: "timeout" };
-        resolve({ ok: false, text: "", provider: providerUsed, reason: reasonMap[code] || `exit_${code}` });
-      }
-    });
-
-    child.on("error", (err) => {
-      settled = true;
-      clearTimeout(sigtermTimer);
-      clearTimeout(sigkillTimer);
-      resolve({ ok: false, text: "", provider, reason: "spawn_error", error: err.message });
-    });
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// FALLBACK EXECUTOR — try primary first, then chain
-// ═══════════════════════════════════════════════════════════════════
-
-const PER_CALL_CAP_MS = 180_000;   // ceiling for a single provider attempt
-const MIN_CALL_BUDGET_MS = 30_000; // below this, an attempt can't succeed anyway
-
+/** Fallback executor keyed by intended primary — thin wrapper over runChain. */
 async function executeWithFallback(primaryKey, prompt, budgetMs, skipList = []) {
-  const start = Date.now();
-  const chain = buildFallbackChain(primaryKey, skipList);
-  const tried = [];
-  const myLocks = []; // track which providers we locked
-
-  for (const key of chain) {
-    // BUDGET FIX: the old perCallBudget used Math.max(120000, ...) — a FLOOR,
-    // so a single call could exceed the node's entire budget, and the loop
-    // never compared elapsed time against budgetMs at all. Worst case one
-    // worker ran 8 × 150s ≈ 20 min regardless of --timeout. Budget is now
-    // checked every iteration and the cap is a ceiling.
-    const remaining = budgetMs - (Date.now() - start);
-    if (remaining < MIN_CALL_BUDGET_MS) {
-      log(`    [fallback] Budget exhausted (${Math.round(remaining / 1000)}s left) — stopping chain.`);
-      tried.push({ key, reason: "budget_exhausted" });
-      break;
-    }
-    const perCallBudget = Math.min(remaining, PER_CALL_CAP_MS);
-
-    // File lock: skip if another worker already has this provider open
-    if (!acquireLock(key)) {
-      log(`    [fallback] Skipping ${key} (locked by another worker)`);
-      tried.push({ key, reason: "locked" });
-      continue;
-    }
-    myLocks.push(key);
-
-    log(`    [fallback] Trying ${key} (${Math.round(perCallBudget / 1000)}s budget)...`);
-
-    const result = await callProvider(prompt, key, perCallBudget);
-
-    if (result.ok) {
-      // Keep lock — marks provider as "in use" so other workers skip it
-      // Degradation = the provider that actually answered ≠ intended primary.
-      // With --single these are equivalent to (key !== primaryKey), but comparing
-      // provider_used keeps arbitration honest even if subprocess semantics
-      // ever change again.
-      const actualProvider = result.provider || key;
-      return {
-        provider_used: actualProvider,
-        primary_intended: primaryKey,
-        degradation: actualProvider !== primaryKey ? {
-          reason: tried.map(t => `${t.key}:${t.reason}`).join("; "),
-          fallback_chain: tried.map(t => t.key),
-          confidence_adjustment: -0.15,
-        } : null,
-        response: cleanResponse(result.text),
-        elapsed_ms: Date.now() - start,
-      };
-    }
-    tried.push({ key, reason: result.reason || "unknown" });
-    releaseLock(key); // failed — release so other worker can try it later
-  }
-
-  // All exhausted — release any remaining locks
-  for (const k of myLocks) releaseLock(k);
-
-  return {
-    provider_used: null,
-    primary_intended: primaryKey,
-    degradation: { reason: "ALL_EXHAUSTED", attempted: tried.map(t => `${t.key}:${t.reason}`), confidence_adjustment: -1.0 },
-    response: null,
-    error: `All providers exhausted: ${tried.map(t => t.key).join(", ")}`,
-  };
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// RESPONSE CLEANING
-// ═══════════════════════════════════════════════════════════════════
-
-const UI_CHROME_PATTERNS = [
-  /^Gemini\s*說[了]?[：:\s]*/gim,
-  /^Gemini\s*said[：:\s]*/gim,
-  /^Claude\s*responded[：:\s]*/gim,
-  /^ChatGPT\s*said[：:\s]*/gim,
-  /^Kimi\s*说[：:\s]*/gim,
-  /Thought\s*for\s*\d+s?\s*/gi,
-  /^You said[：:\s]*.*?\n/gim,
-  // Generic conversational-filler openers (was a hardcoded personal-name
-  // pattern — leaked personal context and didn't generalize).
-  /^[^\n，,]{1,12}[，,]\s*(?:接著要做什麼|接下来要做什么|在想什麼|在想什么|我們進入正題|我们进入正题)[^\n]*/gim,
-  /^我隨時待命[！!。.]?\s*/gim,
-  /^我随时待命[！!。.]?\s*/gim,
-];
-
-function cleanResponse(text) {
-  let cleaned = text || "";
-  for (const pat of UI_CHROME_PATTERNS) {
-    cleaned = cleaned.replace(pat, "");
-  }
-  return cleaned.trim();
+    return runChain(buildFallbackChain(primaryKey, skipList), prompt, budgetMs);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -376,11 +209,11 @@ function qualityGate(result) {
   };
 }
 
-async function runOneWorker(node, budgetMs, skipList = []) {
+async function runOneWorker(node, budgetMs, skipList = [], prompt = node.prompt) {
   const primaryKey = normalizeAI(node.ai);
 
   try {
-    const result = await executeWithFallback(primaryKey, node.prompt, budgetMs, skipList);
+    const result = await executeWithFallback(primaryKey, prompt, budgetMs, skipList);
     const qr = qualityGate(result);
     const degNote = result.degradation
       ? ` ⚠ ${result.provider_used} (intended ${primaryKey})`
@@ -398,50 +231,152 @@ async function runOneWorker(node, budgetMs, skipList = []) {
   }
 }
 
-async function dispatchParallel(dag, budgetMs) {
-  const nodes = dag.nodes;
-  log(`━━━ Module 2: Parallel Dispatch — ${nodes.length} workers ━━━`);
-  log(`  Roles: ${nodes.map(n => `${n.id}→${n.ai}(${n.role})`).join(" | ")}`);
+// ── Wave scheduling — Kahn topological layering ──
+//
+// P0 FIX: dispatchParallel() launched ALL nodes concurrently with a stagger and
+// never read depends_on — it was parsed by tryParsePreDecomposedPlan() and then
+// ignored. A node with depends_on:["research"] whose prompt said "基于上述资料"
+// ran simultaneously with `research` and received nothing: the silent-wrong-
+// answer class. Nodes are now grouped into topological waves; each wave runs in
+// parallel, and downstream prompts receive upstream outputs before dispatch.
 
-  // P0-1: Workers run in PARALLEL — wall-clock time ≈ max(single worker), not sum.
-  // Dividing by nodes.length meant --timeout=900000 gave each worker only ~160s,
-  // less than PER_CALL_CAP_MS (180s), so a single provider attempt couldn't even
-  // complete one full degradation cycle. Each worker now gets the full effective
-  // budget (minus its own stagger offset). Provider contention is already handled
-  // by file locks — no need to slice the budget further.
-  const totalStaggerOverhead = (nodes.length - 1) * STAGGER_MS;
-  const effectiveBudget = Math.max(nodes.length * 60000, budgetMs - totalStaggerOverhead);
+const MAX_INJECT_CHARS_PER_DEP = 12_000; // web UIs have paste/input limits
 
-  // Collect all primary providers so each worker avoids stepping on others' toes
-  const allPrimaries = nodes.map(n => normalizeAI(n.ai));
-  const uniquePrimaries = [...new Set(allPrimaries)];
-
-  // Launch all workers with stagger, each with the full effective budget.
-  // Workers run in parallel — each gets the remaining wall-clock budget from its
-  // own start time (minus its stagger delay to keep all workers aligned to the
-  // same deadline).
-  const tasks = nodes.map((node, i) => {
-    const delay = i * STAGGER_MS;
-    const myPrimary = normalizeAI(node.ai);
-    const skipList = uniquePrimaries.filter(p => p !== myPrimary);
-    const workerBudget = effectiveBudget - delay; // each worker's share of the wall clock
-    return new Promise(resolve => setTimeout(async () => {
-      const r = await runOneWorker(node, workerBudget, skipList);
-      resolve(r);
-    }, delay));
-  });
-
-  // Promise.allSettled — never fails if a single worker throws unexpectedly
-  const settled = await Promise.allSettled(tasks);
-  const results = {};
-  for (const s of settled) {
-    if (s.status === 'rejected') {
-      log(`  Worker promise rejected: ${String(s.reason).slice(0, 60)}`);
-      continue;
+function topoWaves(nodes) {
+  const ids = new Set(nodes.map(n => n.id));
+  for (const n of nodes) {
+    for (const d of (n.depends_on || [])) {
+      if (!ids.has(d)) log(`  WARN: node "${n.id}" depends on unknown node "${d}" — ignoring that edge`);
     }
-    const wr = s.value;
-    if (wr) results[wr.nodeId] = { output: wr.output, quality: wr.quality, node: wr.node };
   }
+  const done = new Set();
+  const waves = [];
+  let rest = [...nodes];
+  while (rest.length > 0) {
+    const wave = rest.filter(n => (n.depends_on || []).every(d => done.has(d) || !ids.has(d)));
+    if (wave.length === 0) {
+      // Cycle: can't order them — run the remainder as one final parallel wave.
+      // injectUpstream() will mark their intra-cycle deps as missing.
+      log(`  WARN: dependency cycle among [${rest.map(n => n.id).join(", ")}] — running them as one final wave`);
+      waves.push(rest);
+      break;
+    }
+    waves.push(wave);
+    for (const n of wave) done.add(n.id);
+    rest = rest.filter(n => !done.has(n.id));
+  }
+  return waves;
+}
+
+/**
+ * Materialize a node's prompt with its dependencies' outputs.
+ * - `{{dep_id}}` placeholders are substituted in place;
+ * - deps without a placeholder are appended as a labelled appendix;
+ * - failed/absent upstream output becomes an explicit note (the worker is told
+ *   the input is missing rather than silently reasoning over nothing).
+ */
+function injectUpstream(node, results) {
+  const deps = node.depends_on || [];
+  if (deps.length === 0) return node.prompt;
+
+  let prompt = node.prompt;
+  const appendix = [];
+  for (const dep of deps) {
+    let out = results[dep]?.output?.response || null;
+    if (out && out.length > MAX_INJECT_CHARS_PER_DEP) {
+      out = out.slice(0, MAX_INJECT_CHARS_PER_DEP) + "\n…（上游输出过长，已截断）";
+    }
+    const marker = `{{${dep}}}`;
+    const role = results[dep]?.node?.role || "";
+
+    if (out) {
+      if (prompt.includes(marker)) prompt = prompt.split(marker).join(out);
+      else appendix.push(`【上游 ${dep}${role ? ` / ${role}` : ""} 的输出】\n${out}`);
+    } else {
+      log(`  [${node.id}] WARN: dependency "${dep}" has no output — injecting failure note`);
+      const note = `（上游 ${dep} 未产出结果 — 请基于任务本身独立完成，并在回答中注明该输入缺失）`;
+      if (prompt.includes(marker)) prompt = prompt.split(marker).join(note);
+      else appendix.push(`【上游 ${dep}】${note}`);
+    }
+  }
+  if (appendix.length > 0) {
+    prompt += `\n\n═══════ 上游任务输出（供参考，请综合利用） ═══════\n\n${appendix.join("\n\n")}`;
+  }
+  return prompt;
+}
+
+async function dispatchWaves(dag, budgetMs) {
+  const nodes = dag.nodes;
+  const waves = topoWaves(nodes);
+  log(`━━━ Module 2: Wave Dispatch — ${nodes.length} workers / ${waves.length} wave(s) ━━━`);
+  waves.forEach((w, i) => log(`  Wave ${i + 1}: ${w.map(n => `${n.id}→${n.ai}(${n.role})`).join(" | ")}`));
+
+  // BUDGET FIX: the floor used to be Math.max(nodes.length * 60000, ...) — it
+  // GREW with node count, so a 4-node DAG got ≥240s regardless of --timeout,
+  // silently violating the user's contract. The floor is now a 60s constant.
+  if (budgetMs < 60_000) log(`  WARN: M2 budget ${Math.round(budgetMs / 1000)}s below 60s floor — raising to 60s`);
+  const deadline = Date.now() + Math.max(60_000, budgetMs);
+
+  const results = {};
+
+  for (let w = 0; w < waves.length; w++) {
+    const wave = waves[w];
+    const remaining = deadline - Date.now();
+
+    if (remaining < 30_000) {
+      const skipped = waves.slice(w).flat();
+      log(`  Wave ${w + 1}: budget exhausted (${Math.round(remaining / 1000)}s left) — skipping ${skipped.length} node(s)`);
+      for (const node of skipped) {
+        results[node.id] = {
+          output: {
+            provider_used: null, primary_intended: normalizeAI(node.ai), response: null,
+            error: "budget_exhausted_before_dispatch",
+            degradation: { reason: "BUDGET_EXHAUSTED", confidence_adjustment: -1.0 },
+          },
+          quality: { passed: false, issues: ["BUDGET_EXHAUSTED"], quality_score: 0 },
+          node,
+        };
+      }
+      break;
+    }
+
+    // Even split of the remaining wall clock across remaining waves — a wave
+    // finishing early donates its leftovers to the next iteration's `remaining`.
+    const wavesLeft = waves.length - w;
+    const waveBudget = Math.min(remaining, Math.max(60_000, Math.floor(remaining / wavesLeft)));
+    // Provider contention only exists WITHIN a wave — skip lists no longer span
+    // the whole DAG, so fallback chains are less constrained than before.
+    const primaries = [...new Set(wave.map(n => normalizeAI(n.ai)))];
+    log(`  Wave ${w + 1}/${waves.length}: ${wave.length} worker(s), budget ${Math.round(waveBudget / 1000)}s`);
+
+    const tasks = wave.map((node, i) => {
+      const delay = i * STAGGER_MS;
+      const myPrimary = normalizeAI(node.ai);
+      const skipList = primaries.filter(p => p !== myPrimary);
+      const prompt = injectUpstream(node, results); // upstream outputs from prior waves
+      const workerBudget = Math.max(30_000, waveBudget - delay);
+      return new Promise(resolve => setTimeout(async () => {
+        resolve(await runOneWorker(node, workerBudget, skipList, prompt));
+      }, delay));
+    });
+
+    // Promise.allSettled — never fails if a single worker throws unexpectedly
+    const settled = await Promise.allSettled(tasks);
+    for (const s of settled) {
+      if (s.status === "rejected") {
+        log(`  Worker promise rejected: ${String(s.reason).slice(0, 60)}`);
+        continue;
+      }
+      if (s.value) results[s.value.nodeId] = { output: s.value.output, quality: s.value.quality, node: s.value.node };
+    }
+
+    // Wave boundary: release locks held on success. holdLockOnSuccess protects
+    // in-flight workers of THIS wave from tab collisions; across waves the
+    // provider is idle again — keeping the lock would force needless degradation
+    // whenever a later wave's primary was already used in an earlier one.
+    cleanupAllLocks();
+  }
+
   return results;
 }
 
@@ -750,12 +685,12 @@ async function main() {
   const dag = await buildDAG(prompt, Math.floor(timeout * 0.3));
   log(`  DAG: ${dag.nodes.map(n => `${n.id}(${n.ai}/${n.role})`).join(" → ")}`);
 
-  // M2: Parallel dispatch
-  // BUDGET FIX: M2 now gets 85% of the time ACTUALLY remaining after M1
-  // (with a floor so workers are never starved), instead of a fixed 0.55×
-  // slice that ignored any M1 overrun.
-  const m2Budget = Math.max(120_000, Math.floor((timeout - (Date.now() - T0)) * 0.85));
-  const results = await dispatchParallel(dag, m2Budget);
+  // M2: Wave dispatch (topological layers, depends_on now honored)
+  // M2 gets 85% of the time ACTUALLY remaining after M1. Floor is a 60s
+  // CONSTANT — the old 120s floor (and dispatchParallel's nodes×60s floor)
+  // could silently exceed the user's --timeout.
+  const m2Budget = Math.max(60_000, Math.floor((timeout - (Date.now() - T0)) * 0.85));
+  const results = await dispatchWaves(dag, m2Budget);
 
   // M3: Arbitrate
   const arbitration = arbitrateResults(dag, results);
@@ -776,4 +711,4 @@ if (require.main === module) {
     main().catch(e => { log(`CRITICAL: ${e.message}`); process.exit(4); });
 }
 
-module.exports = { FALLBACK_CHAIN, buildFallbackChain, normalizeAI, cleanResponse };
+module.exports = { FALLBACK_CHAIN, buildFallbackChain, normalizeAI, cleanResponse, topoWaves, injectUpstream };
