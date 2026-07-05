@@ -91,7 +91,7 @@ bash scripts/start-chrome-debug.sh  # 启动 Chrome daemon
 /AgentChat-WebExtended 帮我写Python脚本/根据文字生成视频
 
 # 4 路并发 — 角色分工 + 证据仲裁
-/AgentChat-FreeSubAgent 复杂问题：根据我的任务调用8个ai生成8个脚本/8个视频
+/AgentChat-FreeSubAgent 高独立性的多个任务：根据我的任务调用8个ai生成8个脚本/8个视频
 
 # 串行深度管道 — 规划→搜索→推理→合成→审查→修复
 /Web-SubAgent-Workflow 帮我设计一个高并发消息队列的架构方案
