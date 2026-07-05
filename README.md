@@ -78,8 +78,6 @@ bash scripts/start-chrome-debug.sh  # 启动 Chrome daemon
 | `index.js` | ⚙️ **Runtime** | Playwright/CDP 实现 |
 | `README.md`（本文件） | 👤 **人类开发者** | 项目介绍、安装、使用 |
 
-> **SKILL.md ≠ README.md**：SKILL.md 是给 AI 读的 playbook，README.md 是给你读的文档。两者各司其职，内容不重复。
->
 > 通过 symlink 将 `skills/` 目录链接到 `~/.claude/skills/`，Claude Code 即可自主调度这些免费资源。
 
 ---
