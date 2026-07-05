@@ -68,17 +68,6 @@ bash scripts/start-chrome-debug.sh  # 启动 Chrome daemon
 
 ```
 
----
-
-## 📂 Skills 概览
-
-| Skill | 职责 | 何时用 |
-|-------|------|--------|
-| **AgentChat-WebExtended** | 8-Provider 降级链，自动切换、Quota 检测、遥测 | 单 prompt 需要高可用；批处理；不关心具体用哪个 AI |
-| **AgentChat-FreeSubAgent** | 任务拆解 → 4 worker 并发 → 证据仲裁 | 复杂研究任务需要多角度互补分析 |
-
----
-
 ## 🧠 Claude Code Integration
 
 本项目是 Claude Code 原生 skill 集合。每个 skill 目录包含：
