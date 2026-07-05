@@ -113,6 +113,11 @@ module.exports = {
     // ── Pre-input: tiered model activation (Pro Extended → Flash → fail) ──
     preInputHook: async (page, cfg, logFn) => {
         const log = logFn || glog;
+        // Per-run reset: _preGenStreak is module-level state. In a long-lived
+        // process that runs this adapter more than once (tests, future daemon
+        // mode), a streak left at MAX from the previous run would make
+        // looksLikePreGeneration() reject fresh filler on the very first poll.
+        _preGenStreak = 0;
         // Extra URL validation — must be on gemini.google.com
         const url = page.url();
         if (!url.includes('gemini.google.com')) {
@@ -210,13 +215,32 @@ module.exports = {
             // Only Ctrl+V if OUR clipboard write succeeded — otherwise we'd paste
             // the user's private clipboard contents into the Gemini page.
             let clipOk = true;
+            let landed = false;
             try {
                 await page.evaluate(t => navigator.clipboard.writeText(t), prompt);
             } catch (_) { clipOk = false; /* clipboard may fail in headless */ }
             if (clipOk) {
                 await page.keyboard.press('ControlOrMeta+v');
                 await page.waitForTimeout(500);
-            } else {
+                // BUGFIX: verify the paste actually landed. Previously a paste
+                // that Quill swallowed (permission granted but paste event eaten)
+                // fell straight to the final length check and FAILED the whole
+                // provider at the INPUT stage — although the chunked-keyboard
+                // path below would have succeeded. Recoverable ≠ fatal.
+                landed = await editor.evaluate(el =>
+                    (el.innerText || el.textContent || '').length
+                ).catch(() => 0) > prompt.length * 0.8;
+            }
+            if (!landed) {
+                if (clipOk) {
+                    // A PARTIAL paste may sit in the editor — clear it first or
+                    // the fallback below would append and duplicate content.
+                    try { await editor.fill(''); } catch {
+                        await page.keyboard.press('ControlOrMeta+a');
+                        await page.keyboard.press('Backspace');
+                    }
+                    await page.waitForTimeout(100);
+                }
                 // Fallback: chunked insertText (O(n) but reliable, no clipboard)
                 for (let i = 0; i < prompt.length; i += 150) {
                     await page.keyboard.insertText(prompt.substring(i, i + 150));

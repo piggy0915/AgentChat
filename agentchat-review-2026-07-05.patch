@@ -1,0 +1,458 @@
+diff --git a/skills/AgentChat-FreeSubAgent/index.js b/skills/AgentChat-FreeSubAgent/index.js
+index 9240eaf..767c0db 100644
+--- a/skills/AgentChat-FreeSubAgent/index.js
++++ b/skills/AgentChat-FreeSubAgent/index.js
+@@ -642,6 +642,17 @@ async function main() {
+     process.exit(1);
+   }
+ 
++  // NaN GUARD: `--timeout=abc` / `--timeout==900000` parse to NaN, which every
++  // comparison below silently passes (NaN < x is false), so NaN used to flow
++  // into ALL budget math — deadlines, wave splits, and finally the executor's
++  // setTimeout(NaN + 30000), which Node coerces to a 1ms delay: every
++  // subprocess got SIGTERM'd ~1ms after spawn and the whole run collapsed into
++  // a wall of inscrutable killed_SIGTERM failures. Fail back to the default.
++  if (!Number.isFinite(timeout) || timeout <= 0) {
++    log(`WARN: invalid --timeout value — falling back to default 600000ms (10 min)`);
++    timeout = 600_000;
++  }
++
+   // UNIT FIX: timeouts are milliseconds, but SKILL.md examples were written in
+   // seconds (--timeout=900 → 900ms → M1 got a 270ms budget and always failed).
+   // Normalize implausibly small values instead of silently starving the run.
+diff --git a/skills/AgentChat-WebExtended/index.js b/skills/AgentChat-WebExtended/index.js
+index faf3230..f228177 100644
+--- a/skills/AgentChat-WebExtended/index.js
++++ b/skills/AgentChat-WebExtended/index.js
+@@ -169,7 +169,16 @@ async function tryAllProviders(browser, prompt, ctx, options = {}) {
+     let startIdx = 0;
+     if (options.startFrom) {
+         const searchName = options.startFrom.toLowerCase();
++        // MATCHING FIX: exact key/name match first. Pure substring matching
++        // resolved --only=mini to GEMINI ("gemini".includes("mini") wins by
++        // chain order before MiniMax is ever considered) — under --single that
++        // silently runs a different provider than the one the caller named
++        // (and locked). Substring stays as a convenience fallback for humans
++        // typing --from=gpt etc.
+         startIdx = PROVIDER_CHAIN.findIndex(p =>
++            p.key === searchName || p.name.toLowerCase() === searchName
++        );
++        if (startIdx === -1) startIdx = PROVIDER_CHAIN.findIndex(p =>
+             p.key.includes(searchName) || p.name.toLowerCase().includes(searchName)
+         );
+         if (startIdx === -1) {
+diff --git a/skills/lib/execute.js b/skills/lib/execute.js
+index 04ae8c6..fe80e0b 100644
+--- a/skills/lib/execute.js
++++ b/skills/lib/execute.js
+@@ -101,6 +101,23 @@ function createExecutor({
+      * @returns {Promise<{ok:boolean, text:string, provider:string, terminal?:boolean, reason?:string, error?:string}>}
+      */
+     function callProvider(prompt, provider, timeoutMs) {
++        // BUDGET CONTRACT FIX: WebExtended's normalizeTimeout() reinterprets any
++        // --timeout < 10000 as SECONDS (×1000) — a human-typo heuristic that is
++        // wrong for programmatic callers. FreeSubAgent's buildDAG can legally
++        // compute a 8-9s slice (0.4 × a small M1 budget), which the child then
++        // inflated to HOURS while our SIGTERM fired at slice+30s: the attempt
++        // burned ~40s of wall clock and died as exit_null instead of finishing
++        // (or timing out) within its slice. Clamp at the spawn boundary so the
++        // value the child sees is always in the "milliseconds" regime.
++        timeoutMs = Math.max(10_000, Math.floor(timeoutMs) || 0);
++
++        // EXIT-CODE CONFLATION GUARD: WebExtended exits 1 for BOTH a usage error
++        // (empty prompt) and ERR_NO_CDP. An empty prompt spawned downstream would
++        // come back as reason "no_cdp" with terminal=true — aborting the caller's
++        // ENTIRE fallback chain over a caller-side bug. Fail fast locally instead.
++        if (!prompt || !String(prompt).trim()) {
++            return Promise.resolve({ ok: false, text: "", provider, reason: "empty_prompt" });
++        }
+         return new Promise((resolve) => {
+             const child = spawn("node", [
+                 webextPath,
+@@ -134,7 +151,7 @@ function createExecutor({
+                 if (!settled) { log(`SIGKILL → ${provider}`); child.kill("SIGKILL"); }
+             }, timeoutMs + 35_000);
+ 
+-            child.on("close", (code) => {
++            child.on("close", (code, signal) => {
+                 settled = true;
+                 clearTimeout(sigtermTimer); clearTimeout(sigkillTimer);
+                 if (truncated) log(`WARN: ${provider} output exceeded 1MB — truncated`);
+@@ -147,10 +164,16 @@ function createExecutor({
+                 if (code === 0 && (text.length >= 5 || (acceptUsedMarker && usedWithChars))) {
+                     resolve({ ok: true, text, provider: providerUsed });
+                 } else {
++                    // code === null ⇒ killed by signal (our SIGTERM/SIGKILL after
++                    // budget overrun, or external kill). Was labelled "exit_null",
++                    // which read like a WebExtended contract violation in logs.
++                    const reason = code === null
++                        ? `killed_${signal || "signal"}`
++                        : (EXIT_REASONS[code] || `exit_${code}`);
+                     resolve({
+                         ok: false, text: "", provider: providerUsed,
+                         terminal: code === 1, // no_cdp — fatal for the whole chain
+-                        reason: EXIT_REASONS[code] || `exit_${code}`,
++                        reason,
+                     });
+                 }
+             });
+diff --git a/skills/lib/locks.js b/skills/lib/locks.js
+index 32b5744..37e6b17 100644
+--- a/skills/lib/locks.js
++++ b/skills/lib/locks.js
+@@ -22,14 +22,43 @@ try { fs.mkdirSync(LOCK_DIR, { recursive: true }); } catch (_) {}
+ const ORPHAN_GRACE_MS = 30_000;   // 30s grace for orphan dirs (no pid file)
+ const LOCK_TTL_MS = 30 * 60_000;  // 30min hard TTL (OS pid reuse window)
+ 
+-function tryReclaim(lockDir) {
+-    const staleDir = `${lockDir}.stale.${process.pid}`;
++/**
++ * Reclaim a stale lock via atomic rename.
++ *
++ * @param {string} lockDir
++ * @param {string|null} expectedPidData — the exact pid-file content we based the
++ *        "stale" decision on, or null when the pid file was missing (orphan dir).
++ *
++ * RACE FIX: renameSync is the atomic arbiter between concurrent reclaimers, but
++ * the old "last resort" branch blind-rmSync'ed lockDir when rename failed. The
++ * rename LOSER would then delete the WINNER's freshly recreated lock and mkdir
++ * its own — leaving TWO processes convinced they hold the same provider lock
++ * (exactly the tab-collision class the locks exist to prevent). Now the loser
++ * only falls back to direct removal if the pid file provably still contains the
++ * same stale content it originally judged (rename can fail spuriously on
++ * Windows when a handle inside the dir is open); any other state means another
++ * process won the race, so we bail with false.
++ */
++function tryReclaim(lockDir, expectedPidData = null) {
++    // Unique suffix — a fixed `.stale.<pid>` target collides (rename onto an
++    // existing non-empty dir throws) when the same process reclaims twice.
++    const staleDir = `${lockDir}.stale.${process.pid}.${Date.now()}`;
+     try {
+         fs.renameSync(lockDir, staleDir);
+-        fs.rmSync(staleDir, { recursive: true, force: true });
++        try { fs.rmSync(staleDir, { recursive: true, force: true }); } catch (_) {}
+     } catch (_) {
+-        // renameSync failed — try direct removal as last resort
+-        try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch (_) {}
++        // Rename failed — most likely another reclaimer already won.
++        try {
++            const current = fs.readFileSync(path.join(lockDir, "pid"), "utf8").trim();
++            if (expectedPidData === null || current !== expectedPidData) {
++                return false; // lock changed hands — it is NOT ours to remove
++            }
++            // Same stale content still in place → rename failed for another
++            // reason (e.g. Windows EPERM). Direct removal is safe-ish here.
++            fs.rmSync(lockDir, { recursive: true, force: true });
++        } catch (_) {
++            return false; // can't verify ownership — never delete blind
++        }
+     }
+     try {
+         fs.mkdirSync(lockDir);
+@@ -59,7 +88,7 @@ function acquireLock(provider) {
+                 // Recover if the directory is older than the grace period.
+                 const stat = fs.statSync(lockDir);
+                 if (Date.now() - stat.mtimeMs > ORPHAN_GRACE_MS) {
+-                    return tryReclaim(lockDir);
++                    return tryReclaim(lockDir, null); // orphan — no pid to verify
+                 }
+                 return false;
+             }
+@@ -71,7 +100,7 @@ function acquireLock(provider) {
+             // Hard TTL: timestamp was never used before — OS can reuse PIDs
+             // after the original process dies, making process.kill() unsafe.
+             if (ts && Date.now() - ts > LOCK_TTL_MS) {
+-                return tryReclaim(lockDir);
++                return tryReclaim(lockDir, data);
+             }
+ 
+             // Check if the process is still alive
+@@ -80,7 +109,7 @@ function acquireLock(provider) {
+                 return false; // process alive — lock is valid
+             } catch (_) {
+                 // Process dead — safe to reclaim
+-                return tryReclaim(lockDir);
++                return tryReclaim(lockDir, data);
+             }
+         } catch (_) {
+             return false;
+@@ -93,9 +122,17 @@ function releaseLock(provider) {
+     try {
+         const pidFile = path.join(lockDir, "pid");
+         const data = fs.readFileSync(pidFile, "utf8").trim();
+-        if (parseInt(data.split("\n")[0], 10) === process.pid) {
+-            fs.rmSync(lockDir, { recursive: true, force: true });
+-        }
++        if (parseInt(data.split("\n")[0], 10) !== process.pid) return;
++        // Atomic release: rename-then-delete, matching tryReclaim. A direct
++        // rmSync had a narrow TOCTOU — if OUR lock was TTL-reclaimed by another
++        // process between the read above and the removal (run > 30min), we'd
++        // delete the new holder's lock. If the rename loses that race, the
++        // lock is no longer ours and we leave it alone.
++        const staleDir = `${lockDir}.release.${process.pid}.${Date.now()}`;
++        try {
++            fs.renameSync(lockDir, staleDir);
++            fs.rmSync(staleDir, { recursive: true, force: true });
++        } catch (_) { /* reclaimed concurrently — not ours anymore */ }
+     } catch (_) {}
+ }
+ 
+@@ -103,14 +140,15 @@ function cleanupAllLocks() {
+     let entries;
+     try { entries = fs.readdirSync(LOCK_DIR); } catch (_) { return; }
+     for (const name of entries) {
+-        const lockDir = path.join(LOCK_DIR, name);
+-        try {
+-            const pidFile = path.join(lockDir, "pid");
+-            const data = fs.readFileSync(pidFile, "utf8").trim();
+-            if (parseInt(data.split("\n")[0], 10) === process.pid) {
+-                fs.rmSync(lockDir, { recursive: true, force: true });
++        // Skip leftover .stale./.release. transfer dirs — best-effort sweep of
++        // our own, in case an rmSync was interrupted mid-teardown.
++        if (name.includes(".stale.") || name.includes(".release.")) {
++            if (name.includes(`.${process.pid}.`)) {
++                try { fs.rmSync(path.join(LOCK_DIR, name), { recursive: true, force: true }); } catch (_) {}
+             }
+-        } catch (_) {}
++            continue;
++        }
++        releaseLock(name); // pid-verified atomic release (see above)
+     }
+ }
+ 
+diff --git a/skills/lib/providerFactory.js b/skills/lib/providerFactory.js
+index e03ce72..6370761 100644
+--- a/skills/lib/providerFactory.js
++++ b/skills/lib/providerFactory.js
+@@ -381,12 +381,46 @@ async function waitForCompletion(page, config, startTime, timeoutMs) {
+     // BUGFIX: same dead-fallback pattern as phase 1 — capture the resolved
+     // boolean instead of discarding it, so unmatched selectors actually get
+     // skipped instead of the loop always keeping the first one.
++    //
++    // BUDGET FIX: each selector previously waited min(selTimeout, timeoutMs)
++    // with NO elapsed-time deduction — after phase 1 legitimately consumed the
++    // budget, an adapter with 5 responseSelectors (e.g. Claude) could still
++    // burn 5 × 30s past the deadline. Per-selector wait is now clamped to the
++    // REMAINING budget, floored at 1s so an already-attached element is still
++    // found instantly even when the budget is spent.
++    //
++    // STALE-RESPONSE GUARD: on a REUSED tab whose SPA restored a previous
++    // conversation, `.last()` initially resolves to the LAST message of the OLD
++    // chat. If the send silently failed (or the new message is slow to mount),
++    // stability polling would see that old, stable text and return a previous
++    // answer for the new prompt — the silent-wrong-answer class. When the
++    // pre-send baseline count for a selector was > 0, we first wait briefly for
++    // element #baseline (the first NEW node) to attach; only if that gate fails
++    // (some UIs replace in place rather than append) do we fall back to the old
++    // `.last()` behavior. baseline === 0 (fresh page, the common case) is a
++    // zero-cost no-op.
+     const selTimeout = config.responseSelectorTimeout || 30_000;
++    const baseline = config.baselineCounts || null;
+     let responseEl = null;
+     for (const sel of config.responseSelectors) {
++        const remaining = timeoutMs - (Date.now() - startTime);
++        const perWait = Math.min(selTimeout, Math.max(1000, remaining));
++
++        if (baseline && Number.isInteger(baseline[sel]) && baseline[sel] > 0) {
++            const freshGate = await page.locator(sel).nth(baseline[sel])
++                .waitFor({ state: 'attached', timeout: Math.min(perWait, 15_000) })
++                .then(() => true)
++                .catch(() => false);
++            if (freshGate) {
++                responseEl = page.locator(sel).last(); // live locator tracks newest
++                break;
++            }
++            // gate failed — fall through to the legacy .last() probe below
++        }
++
+         const loc = page.locator(sel).last();
+         const attached = await loc
+-            .waitFor({ state: 'attached', timeout: Math.min(selTimeout, timeoutMs) })
++            .waitFor({ state: 'attached', timeout: perWait })
+             .then(() => true)
+             .catch(() => false);
+         if (attached) {
+@@ -458,12 +492,21 @@ async function waitForCompletion(page, config, startTime, timeoutMs) {
+     const anchors = config.completionAnchor;
+     if (anchors) {
+         const anchorList = Array.isArray(anchors) ? anchors : [anchors];
+-        const remainingBudget = Math.max(10000, timeoutMs - (Date.now() - startTime));
+-        const perAnchorTimeout = Math.max(5000, Math.floor(remainingBudget / anchorList.length));
++        // BUDGET FIX (P1-7 follow-up): the old Math.max(10000,·) forced a 10s
++        // wait even with the budget exhausted, and the 5s per-anchor floor broke
++        // the "split the remaining budget" invariant — 4 anchors × max(5s, r/4)
++        // can spend 20s when only 10s remain (Gemini has 4 locale variants).
++        // Now: a small 2s grace so a visible anchor is still caught instantly,
++        // a hard cumulative deadline, and a 1s per-anchor floor within it.
++        const remainingBudget = Math.max(2000, timeoutMs - (Date.now() - startTime));
++        const anchorDeadline = Date.now() + remainingBudget;
++        const perAnchorTimeout = Math.max(1000, Math.floor(remainingBudget / anchorList.length));
+         for (const sel of anchorList) {
++            const left = anchorDeadline - Date.now();
++            if (left <= 0) break; // cumulative budget spent — stop probing
+             const found = await page.locator(sel).last().waitFor({
+                 state: 'visible',
+-                timeout: perAnchorTimeout,
++                timeout: Math.min(perAnchorTimeout, left),
+             }).then(() => true).catch(() => false);
+             if (found) break; // first matching anchor wins
+         }
+@@ -519,11 +562,25 @@ const CLOSE_BTN_SEL = [
+  * Returns { block: string|null, detail: string }
+  */
+ async function checkOverlays(page, C) {
+-    for (const sel of OVERLAY_SEL) {
++    // PERF: probe all overlay selectors CONCURRENTLY. The serial loop paid the
++    // full 800ms isVisible timeout per ABSENT selector — 7 selectors ≈ 5.6s of
++    // dead time on every provider visit (the no-overlay case is the common
++    // one). CDP multiplexes fine; the whole scan now costs ~0.8s.
++    let visFlags;
++    try {
++        visFlags = await Promise.all(OVERLAY_SEL.map(sel =>
++            page.locator(sel).first().isVisible({ timeout: 800 }).catch(() => false)
++        ));
++    } catch (_) {
++        visFlags = OVERLAY_SEL.map(() => false);
++    }
++
++    for (let s = 0; s < OVERLAY_SEL.length; s++) {
++        if (!visFlags[s]) continue;
++        const sel = OVERLAY_SEL[s];
+         let el;
+         try {
+             el = page.locator(sel).first();
+-            if (!(await el.isVisible({ timeout: 800 }).catch(() => false))) continue;
+         } catch (_) { continue; }
+ 
+         const text = await el.evaluate(n => (n.innerText || n.textContent || '').trim()).catch(() => '');
+@@ -551,7 +608,10 @@ async function checkOverlays(page, C) {
+             const kind = dismissable ? 'known overlay' : 'unrecognized overlay';
+             return { block: 'error', detail: `${kind} stuck: ${text.slice(0, 120)}` };
+         }
+-        return { block: null }; // dismissed, continue
++        // Dismissed — keep scanning the REMAINING selectors instead of returning:
++        // a welcome popup can sit on top of a quota modal, and the early return
++        // let the quota state slip through to a doomed input attempt.
++        continue;
+     }
+     return { block: null };
+ }
+@@ -684,6 +744,18 @@ function createProviderRunner(cfg) {
+             return classifyError(e, STAGES.INPUT, C.key);
+         }
+ 
++        // ── Step 6.5: baseline response-element counts (stale-response guard) ──
++        // On a reused tab with restored history, phase 2's `.last()` can attach
++        // to the PREVIOUS conversation's final message. Counting matches per
++        // responseSelector BEFORE sending lets waitForCompletion prefer the
++        // first element that appears BEYOND this count. Fresh pages count 0 →
++        // the guard is inert there. Best-effort: failures just disable the guard.
++        const baselineCounts = {};
++        for (const sel of C.responseSelectors) {
++            try { baselineCounts[sel] = await page.locator(sel).count(); }
++            catch (_) { /* guard disabled for this selector */ }
++        }
++
+         // ── Step 7: Send ── (stage label fixed: was mislabeled WAIT_RESPONSE)
+         try {
+             if (C.customSend) {
+@@ -700,7 +772,9 @@ function createProviderRunner(cfg) {
+         // (post-input reset). waitForCompletion's phase-1 comment already assumes
+         // startTime covers pre-send elapsed time; the old code gave waiting a fresh
+         // clock, letting one provider consume up to ~2× its budget.
+-        const responseEl = await waitForCompletion(page, C, provStart, timeoutMs);
++        // Shallow per-run copy: C is shared across invocations of this runner,
++        // so per-run state (baselineCounts) must never be written onto it.
++        const responseEl = await waitForCompletion(page, { ...C, baselineCounts }, provStart, timeoutMs);
+         if (!responseEl) {
+             return classifyError(
+                 new Error('No response element appeared'),
+diff --git a/skills/lib/providers/adapters/gemini.js b/skills/lib/providers/adapters/gemini.js
+index 323e6e9..d89a59f 100644
+--- a/skills/lib/providers/adapters/gemini.js
++++ b/skills/lib/providers/adapters/gemini.js
+@@ -113,6 +113,11 @@ module.exports = {
+     // ── Pre-input: tiered model activation (Pro Extended → Flash → fail) ──
+     preInputHook: async (page, cfg, logFn) => {
+         const log = logFn || glog;
++        // Per-run reset: _preGenStreak is module-level state. In a long-lived
++        // process that runs this adapter more than once (tests, future daemon
++        // mode), a streak left at MAX from the previous run would make
++        // looksLikePreGeneration() reject fresh filler on the very first poll.
++        _preGenStreak = 0;
+         // Extra URL validation — must be on gemini.google.com
+         const url = page.url();
+         if (!url.includes('gemini.google.com')) {
+@@ -210,13 +215,32 @@ module.exports = {
+             // Only Ctrl+V if OUR clipboard write succeeded — otherwise we'd paste
+             // the user's private clipboard contents into the Gemini page.
+             let clipOk = true;
++            let landed = false;
+             try {
+                 await page.evaluate(t => navigator.clipboard.writeText(t), prompt);
+             } catch (_) { clipOk = false; /* clipboard may fail in headless */ }
+             if (clipOk) {
+                 await page.keyboard.press('ControlOrMeta+v');
+                 await page.waitForTimeout(500);
+-            } else {
++                // BUGFIX: verify the paste actually landed. Previously a paste
++                // that Quill swallowed (permission granted but paste event eaten)
++                // fell straight to the final length check and FAILED the whole
++                // provider at the INPUT stage — although the chunked-keyboard
++                // path below would have succeeded. Recoverable ≠ fatal.
++                landed = await editor.evaluate(el =>
++                    (el.innerText || el.textContent || '').length
++                ).catch(() => 0) > prompt.length * 0.8;
++            }
++            if (!landed) {
++                if (clipOk) {
++                    // A PARTIAL paste may sit in the editor — clear it first or
++                    // the fallback below would append and duplicate content.
++                    try { await editor.fill(''); } catch {
++                        await page.keyboard.press('ControlOrMeta+a');
++                        await page.keyboard.press('Backspace');
++                    }
++                    await page.waitForTimeout(100);
++                }
+                 // Fallback: chunked insertText (O(n) but reliable, no clipboard)
+                 for (let i = 0; i < prompt.length; i += 150) {
+                     await page.keyboard.insertText(prompt.substring(i, i + 150));
+diff --git a/skills/lib/terminal.js b/skills/lib/terminal.js
+index 0a090fb..bc10e43 100644
+--- a/skills/lib/terminal.js
++++ b/skills/lib/terminal.js
+@@ -11,8 +11,14 @@
+ 
+ // ── Log with spinner clearing ────────────────────────────────────────────────
+ 
++// TTY detection — when stderr is a PIPE (every subprocess spawned by
++// lib/execute.js), ANSI clear sequences and 10Hz spinner frames are pure
++// noise: they inflate the parent's 1MB stderr capture buffer (risking
++// truncation of the "USED" marker the executor greps for) and garble logs.
++const IS_TTY = Boolean(process.stderr.isTTY);
++
+ function log(prefix, msg) {
+-    process.stderr.write('\r\x1b[K'); // clear spinner line
++    if (IS_TTY) process.stderr.write('\r\x1b[K'); // clear spinner line
+     process.stderr.write(`[${prefix}] ${msg}\n`);
+ }
+ 
+@@ -29,6 +35,9 @@ const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧',
+  * @returns {{ stop: () => void }}
+  */
+ function startTimer(prefix, label) {
++    // Non-TTY: no live spinner — return an inert handle. Frames written at
++    // 10Hz into a pipe accumulate ~400 B/s for the entire provider run.
++    if (!IS_TTY) return { stop() {} };
+     const startTime = Date.now();
+     let i = 0;
+     const interval = setInterval(() => {
+@@ -49,7 +58,7 @@ function startTimer(prefix, label) {
+ // ── Progress spinner (single char, no timer) ─────────────────────────────────
+ 
+ function spinner(ch) {
+-    process.stderr.write(ch);
++    if (IS_TTY) process.stderr.write(ch);
+ }
+ 
+ module.exports = { log, startTimer, spinner };

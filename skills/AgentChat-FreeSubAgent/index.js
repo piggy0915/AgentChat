@@ -642,6 +642,17 @@ async function main() {
     process.exit(1);
   }
 
+  // NaN GUARD: `--timeout=abc` / `--timeout==900000` parse to NaN, which every
+  // comparison below silently passes (NaN < x is false), so NaN used to flow
+  // into ALL budget math — deadlines, wave splits, and finally the executor's
+  // setTimeout(NaN + 30000), which Node coerces to a 1ms delay: every
+  // subprocess got SIGTERM'd ~1ms after spawn and the whole run collapsed into
+  // a wall of inscrutable killed_SIGTERM failures. Fail back to the default.
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    log(`WARN: invalid --timeout value — falling back to default 600000ms (10 min)`);
+    timeout = 600_000;
+  }
+
   // UNIT FIX: timeouts are milliseconds, but SKILL.md examples were written in
   // seconds (--timeout=900 → 900ms → M1 got a 270ms budget and always failed).
   // Normalize implausibly small values instead of silently starving the run.

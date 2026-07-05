@@ -11,8 +11,14 @@
 
 // ── Log with spinner clearing ────────────────────────────────────────────────
 
+// TTY detection — when stderr is a PIPE (every subprocess spawned by
+// lib/execute.js), ANSI clear sequences and 10Hz spinner frames are pure
+// noise: they inflate the parent's 1MB stderr capture buffer (risking
+// truncation of the "USED" marker the executor greps for) and garble logs.
+const IS_TTY = Boolean(process.stderr.isTTY);
+
 function log(prefix, msg) {
-    process.stderr.write('\r\x1b[K'); // clear spinner line
+    if (IS_TTY) process.stderr.write('\r\x1b[K'); // clear spinner line
     process.stderr.write(`[${prefix}] ${msg}\n`);
 }
 
@@ -29,6 +35,9 @@ const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', 
  * @returns {{ stop: () => void }}
  */
 function startTimer(prefix, label) {
+    // Non-TTY: no live spinner — return an inert handle. Frames written at
+    // 10Hz into a pipe accumulate ~400 B/s for the entire provider run.
+    if (!IS_TTY) return { stop() {} };
     const startTime = Date.now();
     let i = 0;
     const interval = setInterval(() => {
@@ -49,7 +58,7 @@ function startTimer(prefix, label) {
 // ── Progress spinner (single char, no timer) ─────────────────────────────────
 
 function spinner(ch) {
-    process.stderr.write(ch);
+    if (IS_TTY) process.stderr.write(ch);
 }
 
 module.exports = { log, startTimer, spinner };

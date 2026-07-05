@@ -381,12 +381,46 @@ async function waitForCompletion(page, config, startTime, timeoutMs) {
     // BUGFIX: same dead-fallback pattern as phase 1 — capture the resolved
     // boolean instead of discarding it, so unmatched selectors actually get
     // skipped instead of the loop always keeping the first one.
+    //
+    // BUDGET FIX: each selector previously waited min(selTimeout, timeoutMs)
+    // with NO elapsed-time deduction — after phase 1 legitimately consumed the
+    // budget, an adapter with 5 responseSelectors (e.g. Claude) could still
+    // burn 5 × 30s past the deadline. Per-selector wait is now clamped to the
+    // REMAINING budget, floored at 1s so an already-attached element is still
+    // found instantly even when the budget is spent.
+    //
+    // STALE-RESPONSE GUARD: on a REUSED tab whose SPA restored a previous
+    // conversation, `.last()` initially resolves to the LAST message of the OLD
+    // chat. If the send silently failed (or the new message is slow to mount),
+    // stability polling would see that old, stable text and return a previous
+    // answer for the new prompt — the silent-wrong-answer class. When the
+    // pre-send baseline count for a selector was > 0, we first wait briefly for
+    // element #baseline (the first NEW node) to attach; only if that gate fails
+    // (some UIs replace in place rather than append) do we fall back to the old
+    // `.last()` behavior. baseline === 0 (fresh page, the common case) is a
+    // zero-cost no-op.
     const selTimeout = config.responseSelectorTimeout || 30_000;
+    const baseline = config.baselineCounts || null;
     let responseEl = null;
     for (const sel of config.responseSelectors) {
+        const remaining = timeoutMs - (Date.now() - startTime);
+        const perWait = Math.min(selTimeout, Math.max(1000, remaining));
+
+        if (baseline && Number.isInteger(baseline[sel]) && baseline[sel] > 0) {
+            const freshGate = await page.locator(sel).nth(baseline[sel])
+                .waitFor({ state: 'attached', timeout: Math.min(perWait, 15_000) })
+                .then(() => true)
+                .catch(() => false);
+            if (freshGate) {
+                responseEl = page.locator(sel).last(); // live locator tracks newest
+                break;
+            }
+            // gate failed — fall through to the legacy .last() probe below
+        }
+
         const loc = page.locator(sel).last();
         const attached = await loc
-            .waitFor({ state: 'attached', timeout: Math.min(selTimeout, timeoutMs) })
+            .waitFor({ state: 'attached', timeout: perWait })
             .then(() => true)
             .catch(() => false);
         if (attached) {
@@ -458,12 +492,21 @@ async function waitForCompletion(page, config, startTime, timeoutMs) {
     const anchors = config.completionAnchor;
     if (anchors) {
         const anchorList = Array.isArray(anchors) ? anchors : [anchors];
-        const remainingBudget = Math.max(10000, timeoutMs - (Date.now() - startTime));
-        const perAnchorTimeout = Math.max(5000, Math.floor(remainingBudget / anchorList.length));
+        // BUDGET FIX (P1-7 follow-up): the old Math.max(10000,·) forced a 10s
+        // wait even with the budget exhausted, and the 5s per-anchor floor broke
+        // the "split the remaining budget" invariant — 4 anchors × max(5s, r/4)
+        // can spend 20s when only 10s remain (Gemini has 4 locale variants).
+        // Now: a small 2s grace so a visible anchor is still caught instantly,
+        // a hard cumulative deadline, and a 1s per-anchor floor within it.
+        const remainingBudget = Math.max(2000, timeoutMs - (Date.now() - startTime));
+        const anchorDeadline = Date.now() + remainingBudget;
+        const perAnchorTimeout = Math.max(1000, Math.floor(remainingBudget / anchorList.length));
         for (const sel of anchorList) {
+            const left = anchorDeadline - Date.now();
+            if (left <= 0) break; // cumulative budget spent — stop probing
             const found = await page.locator(sel).last().waitFor({
                 state: 'visible',
-                timeout: perAnchorTimeout,
+                timeout: Math.min(perAnchorTimeout, left),
             }).then(() => true).catch(() => false);
             if (found) break; // first matching anchor wins
         }
@@ -519,11 +562,25 @@ const CLOSE_BTN_SEL = [
  * Returns { block: string|null, detail: string }
  */
 async function checkOverlays(page, C) {
-    for (const sel of OVERLAY_SEL) {
+    // PERF: probe all overlay selectors CONCURRENTLY. The serial loop paid the
+    // full 800ms isVisible timeout per ABSENT selector — 7 selectors ≈ 5.6s of
+    // dead time on every provider visit (the no-overlay case is the common
+    // one). CDP multiplexes fine; the whole scan now costs ~0.8s.
+    let visFlags;
+    try {
+        visFlags = await Promise.all(OVERLAY_SEL.map(sel =>
+            page.locator(sel).first().isVisible({ timeout: 800 }).catch(() => false)
+        ));
+    } catch (_) {
+        visFlags = OVERLAY_SEL.map(() => false);
+    }
+
+    for (let s = 0; s < OVERLAY_SEL.length; s++) {
+        if (!visFlags[s]) continue;
+        const sel = OVERLAY_SEL[s];
         let el;
         try {
             el = page.locator(sel).first();
-            if (!(await el.isVisible({ timeout: 800 }).catch(() => false))) continue;
         } catch (_) { continue; }
 
         const text = await el.evaluate(n => (n.innerText || n.textContent || '').trim()).catch(() => '');
@@ -551,7 +608,10 @@ async function checkOverlays(page, C) {
             const kind = dismissable ? 'known overlay' : 'unrecognized overlay';
             return { block: 'error', detail: `${kind} stuck: ${text.slice(0, 120)}` };
         }
-        return { block: null }; // dismissed, continue
+        // Dismissed — keep scanning the REMAINING selectors instead of returning:
+        // a welcome popup can sit on top of a quota modal, and the early return
+        // let the quota state slip through to a doomed input attempt.
+        continue;
     }
     return { block: null };
 }
@@ -684,6 +744,18 @@ function createProviderRunner(cfg) {
             return classifyError(e, STAGES.INPUT, C.key);
         }
 
+        // ── Step 6.5: baseline response-element counts (stale-response guard) ──
+        // On a reused tab with restored history, phase 2's `.last()` can attach
+        // to the PREVIOUS conversation's final message. Counting matches per
+        // responseSelector BEFORE sending lets waitForCompletion prefer the
+        // first element that appears BEYOND this count. Fresh pages count 0 →
+        // the guard is inert there. Best-effort: failures just disable the guard.
+        const baselineCounts = {};
+        for (const sel of C.responseSelectors) {
+            try { baselineCounts[sel] = await page.locator(sel).count(); }
+            catch (_) { /* guard disabled for this selector */ }
+        }
+
         // ── Step 7: Send ── (stage label fixed: was mislabeled WAIT_RESPONSE)
         try {
             if (C.customSend) {
@@ -700,7 +772,9 @@ function createProviderRunner(cfg) {
         // (post-input reset). waitForCompletion's phase-1 comment already assumes
         // startTime covers pre-send elapsed time; the old code gave waiting a fresh
         // clock, letting one provider consume up to ~2× its budget.
-        const responseEl = await waitForCompletion(page, C, provStart, timeoutMs);
+        // Shallow per-run copy: C is shared across invocations of this runner,
+        // so per-run state (baselineCounts) must never be written onto it.
+        const responseEl = await waitForCompletion(page, { ...C, baselineCounts }, provStart, timeoutMs);
         if (!responseEl) {
             return classifyError(
                 new Error('No response element appeared'),

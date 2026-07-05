@@ -169,7 +169,16 @@ async function tryAllProviders(browser, prompt, ctx, options = {}) {
     let startIdx = 0;
     if (options.startFrom) {
         const searchName = options.startFrom.toLowerCase();
+        // MATCHING FIX: exact key/name match first. Pure substring matching
+        // resolved --only=mini to GEMINI ("gemini".includes("mini") wins by
+        // chain order before MiniMax is ever considered) — under --single that
+        // silently runs a different provider than the one the caller named
+        // (and locked). Substring stays as a convenience fallback for humans
+        // typing --from=gpt etc.
         startIdx = PROVIDER_CHAIN.findIndex(p =>
+            p.key === searchName || p.name.toLowerCase() === searchName
+        );
+        if (startIdx === -1) startIdx = PROVIDER_CHAIN.findIndex(p =>
             p.key.includes(searchName) || p.name.toLowerCase().includes(searchName)
         );
         if (startIdx === -1) {

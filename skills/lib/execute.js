@@ -101,6 +101,23 @@ function createExecutor({
      * @returns {Promise<{ok:boolean, text:string, provider:string, terminal?:boolean, reason?:string, error?:string}>}
      */
     function callProvider(prompt, provider, timeoutMs) {
+        // BUDGET CONTRACT FIX: WebExtended's normalizeTimeout() reinterprets any
+        // --timeout < 10000 as SECONDS (×1000) — a human-typo heuristic that is
+        // wrong for programmatic callers. FreeSubAgent's buildDAG can legally
+        // compute a 8-9s slice (0.4 × a small M1 budget), which the child then
+        // inflated to HOURS while our SIGTERM fired at slice+30s: the attempt
+        // burned ~40s of wall clock and died as exit_null instead of finishing
+        // (or timing out) within its slice. Clamp at the spawn boundary so the
+        // value the child sees is always in the "milliseconds" regime.
+        timeoutMs = Math.max(10_000, Math.floor(timeoutMs) || 0);
+
+        // EXIT-CODE CONFLATION GUARD: WebExtended exits 1 for BOTH a usage error
+        // (empty prompt) and ERR_NO_CDP. An empty prompt spawned downstream would
+        // come back as reason "no_cdp" with terminal=true — aborting the caller's
+        // ENTIRE fallback chain over a caller-side bug. Fail fast locally instead.
+        if (!prompt || !String(prompt).trim()) {
+            return Promise.resolve({ ok: false, text: "", provider, reason: "empty_prompt" });
+        }
         return new Promise((resolve) => {
             const child = spawn("node", [
                 webextPath,
@@ -134,7 +151,7 @@ function createExecutor({
                 if (!settled) { log(`SIGKILL → ${provider}`); child.kill("SIGKILL"); }
             }, timeoutMs + 35_000);
 
-            child.on("close", (code) => {
+            child.on("close", (code, signal) => {
                 settled = true;
                 clearTimeout(sigtermTimer); clearTimeout(sigkillTimer);
                 if (truncated) log(`WARN: ${provider} output exceeded 1MB — truncated`);
@@ -147,10 +164,16 @@ function createExecutor({
                 if (code === 0 && (text.length >= 5 || (acceptUsedMarker && usedWithChars))) {
                     resolve({ ok: true, text, provider: providerUsed });
                 } else {
+                    // code === null ⇒ killed by signal (our SIGTERM/SIGKILL after
+                    // budget overrun, or external kill). Was labelled "exit_null",
+                    // which read like a WebExtended contract violation in logs.
+                    const reason = code === null
+                        ? `killed_${signal || "signal"}`
+                        : (EXIT_REASONS[code] || `exit_${code}`);
                     resolve({
                         ok: false, text: "", provider: providerUsed,
                         terminal: code === 1, // no_cdp — fatal for the whole chain
-                        reason: EXIT_REASONS[code] || `exit_${code}`,
+                        reason,
                     });
                 }
             });
