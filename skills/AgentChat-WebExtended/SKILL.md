@@ -9,6 +9,16 @@ description: Multi-provider CDP bridge with automatic fallback (Gemini->ChatGPT-
 > **核心功能**: 按优先级链自动降级，确保始终有一个可用的大模型
 > **变更日志**: 见 [CHANGELOG.md](CHANGELOG.md)
 
+## ⚠️ 强制规则 — 调用即执行
+
+**本 skill 被调用时，必须执行 `node` 命令将用户问题发送到 web AI。禁止只解释用法而不执行。**
+
+- ❌ 禁止：读完 SKILL.md 后描述 fallback 链、罗列 CLI 参数、讲解架构——却不跑 `node index.js`
+- ✅ 必须：`node skills/AgentChat-WebExtended/index.js "<用户prompt>"` 作为首要动作。web AI 返回结果后，才可补充你的分析
+- 例外：`--smoke`、`--doctor`，或用户明确要求"只检查环境不发送"
+
+---
+
 ## Trigger
 
 Use this skill when:

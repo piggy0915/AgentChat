@@ -10,6 +10,14 @@ description: Parallel AI task decomposition orchestrator — Claude Code decompo
 > **🛡 安全策略**: 永远不关闭用户 Chrome。`--keep-tabs` 硬编码为 true。
 > **Provider 层**: 单一源 — `AgentChat-WebExtended` (8 providers, 零代码重复)
 
+## ⚠️ 强制规则 — 调用即执行
+
+**本 skill 被调用时，必须执行 `node` 命令将任务派发到多个 AI。禁止只解释流程而不执行。**
+
+- ❌ 禁止：读完 SKILL.md 后讲解 4 角色分工、描述 DAG 并发原理——却不跑 `node index.js`
+- ✅ 必须：拆解任务 → 写 JSON plan → `node skills/AgentChat-FreeSubAgent/index.js --timeout=900000 '<JSON>'` 作为核心动作。结果返回后才可补充你的解读
+- 例外：`--smoke`、`--doctor`，或用户明确要求"只检查环境不发送"
+
 ## Architecture
 
 ```

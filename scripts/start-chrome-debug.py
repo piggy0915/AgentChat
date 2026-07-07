@@ -392,6 +392,20 @@ def main():
     log.info(f"Chrome: {CHROMIUM}")
     log.info(f"Profile: {PROFILE}")
 
+    # Guard: refuse to start if another daemon is already running.
+    # The shell wrapper (start-chrome-debug.sh) normally enforces single-instance,
+    # but if someone runs this script directly, two daemons sharing one Chrome
+    # profile will corrupt it. Check the daemon pid file before proceeding.
+    if os.path.exists(DAEMON_PID_FILE):
+        try:
+            with open(DAEMON_PID_FILE) as f:
+                prev_pid = int(f.read().strip())
+            os.kill(prev_pid, 0)
+            log.error(f"Daemon already running (PID {prev_pid}). Refusing to start.")
+            sys.exit(1)
+        except (OSError, ValueError):
+            pass  # stale pid file — proceed
+
     # Clean stale lock files from previous crashes
     for lock in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
         path = os.path.join(PROFILE, lock)

@@ -161,8 +161,15 @@ function createExecutor({
                 const providerUsed = used ? used[1].toLowerCase() : provider;
                 const usedWithChars = stderr.match(/✓\s*\w+:\s*USED\s*\(\d+\s*chars/);
 
-                if (code === 0 && (text.length >= 5 || (acceptUsedMarker && usedWithChars))) {
+                if (code === 0 && text.length >= 5) {
                     resolve({ ok: true, text, provider: providerUsed });
+                } else if (code === 0 && acceptUsedMarker && usedWithChars && text.length < 5) {
+                    // USED marker found but stdout was empty — the child's
+                    // process.stdout.write callback (#2 flush fix) should prevent
+                    // this, but if it still happens, don't silently return an empty
+                    // success. Let the fallback chain try another provider.
+                    resolve({ ok: false, text: "", provider: providerUsed,
+                              reason: "stdout_lost_after_used_marker" });
                 } else {
                     // code === null ⇒ killed by signal (our SIGTERM/SIGKILL after
                     // budget overrun, or external kill). Was labelled "exit_null",

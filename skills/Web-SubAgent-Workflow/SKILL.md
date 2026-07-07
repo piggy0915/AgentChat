@@ -9,6 +9,28 @@ description: Sequential 6-step AI pipeline — Claude Code plans→Kimi searches
 > **Provider 层**: `AgentChat-WebExtended`，零代码重复
 > **安全策略**: 永不关闭用户 Chrome
 
+## ⚠️ 强制规则 — 调用即执行
+
+**本 skill 被调用时，必须依次执行 Step 1→6。Step 2 和 Step 5 无条件执行，Step 3 由复杂度决定。禁止跳过任何步骤，禁止只解释流程而不执行。**
+
+核心约束:
+- ❌ 禁止：读了 SKILL.md 后描述流水线、解释角色分工、分析架构——却不跑 `node index.js`
+- ❌ 禁止：以"任务太简单/纯本地/不需要搜索"为由跳过 Step 2 (`--search`)
+- ❌ 禁止：以"产出很简单/不需要审查"为由跳过 Step 5 (`--review`)
+- ❌ 禁止：用本地文件读取、代码分析、或 Claude 自身知识替代 `node index.js` 调用
+- ✅ 必须：Step 2 和 Step 5 **无条件执行**。复杂度判定仅影响 Step 3（Gemini 推理）是否跳过
+- ✅ 必须：每步产生可验证的 `node index.js` JSON 输出，结果返回后才可补充你的解读
+
+**反绕过原则**: 如果某个步骤"看起来不需要 web AI"，正确的做法是仍然通过 `node index.js` 把本地发现发给 web AI 做验证/补充/交叉检查——而不是跳过该步骤。Step 2 的搜索 prompt 和 Step 5 的审查内容必须包含 Claude 已做的本地分析结果，让 web AI 做二次确认。
+
+**自检清单** (Claude Code 在最终输出前必须确认全部完成):
+- [ ] Step 2: `node index.js --search` 已执行，返回了 JSON？
+- [ ] Step 3: (复杂时) `node index.js --reason` 已执行？(简单时) 已明确记录跳过理由？
+- [ ] Step 5: `node index.js --review` 已执行，返回了 JSON？
+- [ ] Step 6: 审查意见已逐条处理？
+
+例外: `--smoke`、`--doctor`，或用户明确要求"只检查环境不发送"
+
 ## 架构
 
 ```
@@ -28,7 +50,9 @@ description: Sequential 6-step AI pipeline — Claude Code plans→Kimi searches
 
 ## 复杂度判定 (Step 1)
 
-决定 Step 3 是否执行。**不确定时倾向判定为"复杂"**。
+**仅决定 Step 3 (Gemini 推理) 是否执行。不影响 Step 2 和 Step 5 的强制执行。**
+
+**不确定时倾向判定为"复杂"**。
 
 **复杂** (触发 Step 3，满足 ≥2 项):
 - 需综合多个信息源才能得出结论
@@ -37,7 +61,7 @@ description: Sequential 6-step AI pipeline — Claude Code plans→Kimi searches
 - 问题域需要领域专长
 - 用户要求"深度分析"或"全面方案"
 
-**简单** (跳过 Step 3):
+**简单** (跳过 Step 3，但 Step 2 和 Step 5 仍然必须执行):
 - 单事实查询、≤50 行直观代码、格式转换等机械工作
 
 ---
@@ -46,13 +70,18 @@ description: Sequential 6-step AI pipeline — Claude Code plans→Kimi searches
 
 ### Step 1: 规划与分发
 
-1. 理解需求，判定复杂度
-2. **编写一个综合搜索 prompt**（涵盖所有要查的方面，Kimi 内部自动多角度搜索）
-3. 向用户报告：复杂度 + 搜索查询 + 预期产出
+1. 理解需求，快速浏览相关本地文件
+2. 判定复杂度（仅决定 Step 3 是否执行）
+3. **编写综合搜索 prompt** — 必须包含:
+   - 用户原始需求
+   - Claude 已做的本地分析摘要（文件内容、项目结构等发现）
+   - 需要 web AI 补充/验证的领域背景或最新进展
+   - **即使问题看似纯本地，也必须构造搜索 prompt**——至少让 Kimi 验证本地发现、补充领域最新动态、或交叉检查 Claude 的判断
+4. 向用户报告：复杂度 + 搜索查询 + 预期产出
 
-### Step 2: 联网检索
+### Step 2: 联网检索 (无条件执行)
 
-⚠️ **只调用一次。** Kimi 内部自动多轮搜索，外部拆分反而导致碎片化。
+⚠️ **无论任务类型，此步骤不可跳过。** 即使问题 100% 是本地文件理解，也必须执行搜索——价值在于补充领域背景、验证本地发现、发现 README 没有的最新进展。
 
 ```bash
 node skills/Web-SubAgent-Workflow/index.js --search "综合搜索 prompt"
@@ -74,11 +103,13 @@ Fallback: Gemini → ChatGPT → Claude
 
 ### Step 4: 核心生成
 
-汇总搜索事实 + 推理结论 + 原始需求，生成最终交付物（代码/文档/报告）。自检：所有搜索事实已纳入？推理结论已被吸收？需求要点全覆盖？
+汇总搜索事实 + 推理结论(如有) + 原始需求，生成最终交付物（代码/文档/报告）。自检：所有搜索事实已纳入？推理结论已被吸收？需求要点全覆盖？
 
-### Step 5: 交叉审查
+### Step 5: 交叉审查 (无条件执行)
 
-将 Step 4 产出发给 ChatGPT。审查维度：正确性、安全性、性能、可维护性。
+⚠️ **无论任务类型，此步骤不可跳过。** 将 Step 4 产出全文发给 ChatGPT。审查维度：正确性、安全性、性能、可维护性。
+
+即使产出"很简单"，审查的价值在于：发现 Claude 可能忽略的错误、验证事实准确性、检查逻辑一致性。简单产出的审查可能很快（"无问题"也是有效结果），但必须执行。
 
 ```bash
 node skills/Web-SubAgent-Workflow/index.js --review "原始需求: ...待审查产出: ...请从正确性、安全性、性能、可维护性逐一审查，列出问题并给修改建议。不要重写方案。"

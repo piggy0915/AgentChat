@@ -498,11 +498,23 @@ function arbitrateResults(dag, results) {
     trust[node.id] = assignTrust(node, results[node.id]);
   }
 
-  // Resolve role texts (role name → actual response)
+  // Resolve role texts (role name → actual response).
+  // Two nodes with the same role were previously overwritten — the first node's
+  // output silently vanished from arbitration. Collect all responses per role.
   const roleText = {};
   for (const node of nodes) {
     const r = results[node.id];
-    if (r?.output?.response) roleText[node.role] = r.output.response;
+    if (r?.output?.response) {
+      roleText[node.role] = (roleText[node.role] || []).concat(r.output.response);
+    }
+  }
+  // Flatten: reviewer alerts downstream expect strings, so join multi-response roles.
+  for (const [role, texts] of Object.entries(roleText)) {
+    if (Array.isArray(texts) && texts.length > 1) {
+      roleText[role] = texts.join("\n---\n");
+    } else if (Array.isArray(texts)) {
+      roleText[role] = texts[0];
+    }
   }
 
   // Reviewer Alerts
