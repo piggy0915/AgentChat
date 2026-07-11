@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM AgentChat — Windows 一键环境安装脚本
+REM AgentChat - Windows 一键环境安装脚本
 REM
 REM 检查并安装所有依赖：Python, Node.js, Playwright, Chrome
 REM 用法: 双击运行或在命令行执行 scripts\setup.bat
@@ -10,7 +10,7 @@ setlocal enabledelayedexpansion
 title AgentChat Setup
 
 echo ========================================
-echo   AgentChat — Environment Setup
+echo   AgentChat - Environment Setup
 echo ========================================
 echo.
 
@@ -29,7 +29,11 @@ echo   OK
 REM ── 安装 Python 依赖 ─────────────────────────────────────────────────
 echo   Installing Python dependencies...
 pip install playwright websocket-client -q 2>&1
-python -m playwright install chromium 2>&1
+REM NOTE: "python -m playwright install chromium" removed - the Windows flow
+REM launches SYSTEM Chrome (start-chrome.ps1) and connects over CDP;
+REM connect_over_cdp needs no bundled browser, and the Linux daemon actively
+REM REJECTS Playwright Chromium (no login state). The download was ~300MB of
+REM dead weight.
 echo   OK
 
 :check_node
@@ -48,7 +52,10 @@ echo   OK
 
 REM ── 安装 npm 依赖 ────────────────────────────────────────────────────
 echo   Installing npm dependencies...
-cd /d "%~dp0..\skills\gemini-web-extended-thinking"
+REM BUGFIX: path pointed at the pre-rename skill dir
+REM (gemini-web-extended-thinking) - cd failed, so npm install ran in
+REM scripts\ and installed nothing useful.
+cd /d "%~dp0..\skills\AgentChat-WebExtended"
 call npm install --registry=https://registry.npmmirror.com 2>&1
 cd /d "%~dp0"
 echo   OK
@@ -86,6 +93,6 @@ echo   Next steps:
 echo     1. Edit .env if you need proxy settings
 echo     2. Run: powershell .\scripts\start-chrome.ps1 -FirstLogin
 echo     3. Log in to Gemini in the Chrome window
-echo     4. Test: node skills\gemini-web-extended-thinking\index.js --smoke
+echo     4. Test: node skills\AgentChat-WebExtended\index.js --smoke
 echo.
 pause

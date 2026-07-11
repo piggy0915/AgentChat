@@ -9,6 +9,15 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Load .env with the shared safe parser — previously this script never read
+# .env at all, so CHROMIUM_PATH / PROXY_SERVER / CDP_PORT configured there
+# were invisible to the checks below (false ❌ on correctly-configured setups).
+source "$SCRIPT_DIR/lib-env.sh"
+load_project_env "$PROJECT_DIR"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -18,6 +27,11 @@ pass_count=0
 fail_count=0
 warn_count=0
 
+# BUGFIX: counters used ((var++)) — post-increment evaluates to the OLD value,
+# so the FIRST passing check ran ((pass_count++)) with pass_count=0, the
+# arithmetic command returned status 1, and `set -euo pipefail` killed the
+# whole script right after printing its first ✅. POSIX assignment form is
+# always status 0.
 check() {
     local desc="$1"
     local cmd="$2"
@@ -25,14 +39,14 @@ check() {
     printf "  %-50s " "$desc"
     if eval "$cmd" > /dev/null 2>&1; then
         echo -e "${GREEN}✅${NC}"
-        ((pass_count++))
+        pass_count=$((pass_count+1))
     else
         if [ -n "$fix" ]; then
             echo -e "${YELLOW}⚠️  修复: $fix${NC}"
-            ((warn_count++))
+            warn_count=$((warn_count+1))
         else
             echo -e "${RED}❌${NC}"
-            ((fail_count++))
+            fail_count=$((fail_count+1))
         fi
     fi
 }
@@ -60,8 +74,13 @@ check "websocket-client (CDP fallback)" \
     "pip3 install websocket-client"
 
 # System Chrome (NOT Playwright Chromium — daemon rejects it)
+# BUGFIX: the old command referenced a BARE \$CHROMIUM_PATH — under `set -u`
+# an unset variable is an expansion error that kills the whole script even
+# inside an `if eval` condition (verified: the script died mid-line right
+# here once the counter bug above stopped masking it). \${VAR:-} is safe,
+# and `test -x ""` is false anyway, so the -n guard was redundant.
 check "System Chrome (CHROMIUM_PATH)" \
-    "test -n \"\${CHROMIUM_PATH:-}\" -a -x \"\$CHROMIUM_PATH\" -o -x /usr/bin/google-chrome-stable -o -x /usr/bin/chromium -o -x /usr/bin/google-chrome" \
+    "test -x \"\${CHROMIUM_PATH:-}\" -o -x /usr/bin/google-chrome-stable -o -x /usr/bin/chromium -o -x /usr/bin/google-chrome" \
     "安装系统 Chrome 并在 .env 设置 CHROMIUM_PATH"
 
 echo ""

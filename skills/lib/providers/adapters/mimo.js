@@ -16,7 +16,12 @@ module.exports = {
     authDomains: ['aistudio.xiaomimimo.com/login', 'auth0.com'],
     quotaPatterns: [
         ...COMMON_CN_QUOTA_PATTERNS,
-        /免费版.*升级/i,
+        // BUGFIX: bare /免费版.*升级/i matched permanent upsell banners
+        // visible on EVERY MiMo page ("免费版" branding + "升级" CTA in the
+        // header/sidebar area), falsely marking the provider as quota-
+        // exhausted. Only treat it as quota when tied to a usage-exhausted
+        // context (same principle as Gemini/Kimi adapter fixes).
+        /(?:额度|次数|用完|用尽|已达|上限).{0,30}免费版.*升级/i,
     ],
     dismissPatterns: [...COMMON_DISMISS_PATTERNS],
     editorSelectors: [

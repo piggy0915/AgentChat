@@ -36,6 +36,15 @@ const PER_CALL_CAP_MS = 180_000;   // ceiling for a single provider attempt
 const MIN_CALL_BUDGET_MS = 30_000; // below this, an attempt can't succeed anyway
 const MAX_BUFFER = 1024 * 1024;    // 1MB stdout/stderr cap to prevent OOM
 
+// LOCKED-PROVIDER RETRY: when a provider is temporarily locked by another worker,
+// don't permanently skip it — retry with exponential backoff. The old behaviour
+// (one shot → permanent skip) conflated "transient resource conflict" with
+// "provider dead", so 8 concurrent workers easily starved each other into
+// ALL_EXHAUSTED even when every provider was healthy. Budget-aware: retries stop
+// once remaining budget < minCallBudgetMs.
+const MAX_LOCK_RETRIES = 3;
+const LOCK_BACKOFF_BASE_MS = 5_000; // 5s → 15s → 30s
+
 // WebExtended exit-code contract (see its header comment)
 const EXIT_REASONS = {
     1: "no_cdp", 2: "auth", 3: "safety", 4: "internal",
@@ -215,8 +224,28 @@ function createExecutor({
             }
             const perCall = Math.min(remaining, perCallCapMs);
 
-            if (!acquireLock(key)) {
-                log(`[fallback] Skipping ${key} (locked by another worker)`);
+            // LOCKED-PROVIDER RETRY: transient resource conflict (another
+            // worker holds the provider lock) is NOT the same as a dead
+            // provider. The old code permanently skipped locked providers,
+            // so 8 concurrent workers could starve each other into
+            // ALL_EXHAUSTED even when every provider was healthy. Retry with
+            // exponential backoff (5s → 15s → 30s), budget-aware so we
+            // don't burn the call budget on waiting alone.
+            let lockAcquired = acquireLock(key);
+            let lockRetries = 0;
+            while (!lockAcquired && lockRetries < MAX_LOCK_RETRIES) {
+                const waitMs = Math.min(
+                    LOCK_BACKOFF_BASE_MS * Math.pow(3, lockRetries),
+                    Math.max(0, budgetMs - (Date.now() - start) - minCallBudgetMs)
+                );
+                if (waitMs <= 1000) break; // budget too tight — don't wait
+                log(`[fallback] ${key} locked — retry in ${Math.round(waitMs / 1000)}s (${lockRetries + 1}/${MAX_LOCK_RETRIES})`);
+                await new Promise(r => setTimeout(r, waitMs));
+                lockAcquired = acquireLock(key);
+                lockRetries++;
+            }
+            if (!lockAcquired) {
+                log(`[fallback] Skipping ${key} (locked after ${lockRetries} retries)`);
                 tried.push({ provider: key, reason: "locked" });
                 continue;
             }

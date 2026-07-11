@@ -18,12 +18,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# ---- Auto-load .env from project root ----
-if [ -f "$PROJECT_DIR/.env" ]; then
-    set -a
-    source "$PROJECT_DIR/.env"
-    set +a
-fi
+# ---- Auto-load .env (safe KEY=VALUE parser — NEVER `source` untrusted .env) ----
+# SECURITY FIX: this script previously did `set -a; source .env; set +a`,
+# re-opening the exact arbitrary-code-execution vector that
+# start-chrome-debug.sh's P0 fix (2026-06-29) was written to close.
+source "$SCRIPT_DIR/lib-env.sh"
+load_project_env "$PROJECT_DIR"
 
 # ---- Config (env vars override defaults) ----
 CDP_PORT="${CDP_PORT:-9222}"

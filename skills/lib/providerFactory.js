@@ -575,6 +575,7 @@ async function checkOverlays(page, C) {
         visFlags = OVERLAY_SEL.map(() => false);
     }
 
+    let anyDismissed = false;
     for (let s = 0; s < OVERLAY_SEL.length; s++) {
         if (!visFlags[s]) continue;
         const sel = OVERLAY_SEL[s];
@@ -582,6 +583,20 @@ async function checkOverlays(page, C) {
         try {
             el = page.locator(sel).first();
         } catch (_) { continue; }
+
+        // STALE-SNAPSHOT GUARD: visFlags was captured BEFORE any dismissal.
+        // The same modal typically matches several selectors ([role="dialog"]
+        // AND [class*="dialog"]). After the first selector dismissed it, later
+        // selectors still carried visFlags=true; the now-HIDDEN element's
+        // textContent still matched (innerText is '' when hidden, so the ||
+        // falls through to textContent), but its close button was invisible —
+        // tryDismissOverlay failed and a SUCCESSFULLY dismissed popup came
+        // back as {block:'error'}, failing the provider. Once anything was
+        // dismissed, re-probe visibility live before processing.
+        if (anyDismissed) {
+            const stillVisible = await el.isVisible({ timeout: 300 }).catch(() => false);
+            if (!stillVisible) continue;
+        }
 
         const text = await el.evaluate(n => (n.innerText || n.textContent || '').trim()).catch(() => '');
         if (text.length < 5) continue;
@@ -611,6 +626,7 @@ async function checkOverlays(page, C) {
         // Dismissed — keep scanning the REMAINING selectors instead of returning:
         // a welcome popup can sit on top of a quota modal, and the early return
         // let the quota state slip through to a doomed input attempt.
+        anyDismissed = true;
         continue;
     }
     return { block: null };

@@ -134,9 +134,17 @@ function findProviderPage(context, provider) {
     const hosts = getProviderHosts(provider);
     return context.pages().find(p => {
         try {
-            const pu = p.url();
-            if (pu.includes('about:blank')) return false;
-            return hosts.some(h => pu.includes(h));
+            // HOSTNAME MATCH (was: substring over the FULL URL). A tab whose
+            // path/query merely MENTIONS a provider domain — e.g. a Google
+            // search for "gemini.google.com api" — matched the old
+            // pu.includes(host) check, and the runner then page.goto()'d that
+            // tab away: navigating an unrelated USER tab, exactly what the
+            // keep-tabs policy forbids. Parse the URL and compare hostnames
+            // (exact or subdomain) instead.
+            const pageUrl = p.url();
+            if (!pageUrl || pageUrl.startsWith('about:')) return false;
+            const host = new URL(pageUrl).hostname;
+            return hosts.some(h => host === h || host.endsWith('.' + h));
         } catch { return false; }
     }) || null;
 }
@@ -477,9 +485,19 @@ async function main() {
         });
 
         if (result.success) {
-            console.log(result.response); // stdout for piping
+            // P0 FLUSH FIX: console.log + immediate process.exit truncates piped
+            // stdout at the pipe-buffer boundary (~128KB on Linux, less on
+            // Windows/macOS). A PARTIAL flush still passes the parent executor's
+            // `text.length >= 5` success check, returning corrupted text as
+            // ok:true — the silent-wrong-answer class. This is the "#2 flush
+            // fix" that lib/execute.js's acceptUsedMarker comment references:
+            // exit only from the write callback, after the kernel accepted the
+            // full payload. (process.exit is still required here — the CDP
+            // websocket keeps the event loop alive, so a natural exit never
+            // happens; exitCode-and-return is NOT an option in this file.)
             ctx.recordTelemetry(0);
-            process.exit(0);
+            process.stdout.write(result.response + '\n', () => process.exit(0));
+            return;
         }
 
         // Classify failure — reasons are now objects {reason, error_details}

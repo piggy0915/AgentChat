@@ -46,8 +46,10 @@ module.exports = {
     ],
     sendFallback: 'Enter',
     stopSelectors: [
-        'button[aria-label="Stop"]',
-        'button[aria-label="Stop generating"]',
+        // Only two genuinely distinct selectors; the wildcard `*="Stop"` already
+        // covers both exact aria-label variants.  Dedup saves up to 6s of serial
+        // probe time in waitForCompletion phase 1 (2 redundant selectors × 3s
+        // STOP_PROBE_TIMEOUT_MS each).
         'button[aria-label*="Stop"]',
         '[data-testid="stop-button"]',
     ],

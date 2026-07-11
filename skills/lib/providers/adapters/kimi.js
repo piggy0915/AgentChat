@@ -19,7 +19,13 @@ module.exports = {
         /高峰.*算力.*不足/i,
         /Kimi.*(?:累了|休息)/i,
         /聊的人太多了/i,
-        /前往升级/i,
+        // BUGFIX: bare /前往升级/i matched the permanent "Upgrade" CTA
+        // button/text visible on EVERY Kimi page (sidebar upsell banner),
+        // falsely marking a perfectly available provider as quota-exhausted.
+        // Only treat it as quota when tied to a usage-exhausted context
+        // (same principle as Gemini adapter's narrow quota patterns — any
+        // bare "Upgrade" link would false-positive on every page visit).
+        /(?:额度|次数|用完|用尽|不够|上限).{0,30}前往升级/i,
         /额度.*(?:已|用).*(?:完|尽|满)/i,
     ],
     dismissPatterns: [...COMMON_DISMISS_PATTERNS, /版本.*更新/i],

@@ -44,14 +44,42 @@ $CDP_PORT      = if ($env:CDP_PORT) { [int]$env:CDP_PORT } else { 9222 }
 $PROFILE_DIR   = if ($env:CHROME_PROFILE) { $env:CHROME_PROFILE } else { "$env:USERPROFILE\.chrome-debug-profile" }
 $GEMINI_URL    = if ($env:GEMINI_URL) { $env:GEMINI_URL } else { "https://gemini.google.com/u/0/app" }
 $PROXY_SERVER  = if ($env:PROXY_SERVER) { $env:PROXY_SERVER } else { "" }
+# PID file for the Chrome instance WE launch — mirrors the Linux daemon's
+# /tmp/chrome-debug.chrome.pid, enabling precise cleanup instead of killing
+# every Chrome on the machine.
+$CHROME_PID_FILE = Join-Path $env:TEMP "chrome-debug.chrome.pid"
+
+# Stop ONLY the managed Chrome recorded in the PID file. Returns $true if a
+# process was stopped. POLICY: never touch the user's own Chrome windows.
+function Stop-ManagedChrome {
+    if (-not (Test-Path $CHROME_PID_FILE)) { return $false }
+    $managedPid = Get-Content $CHROME_PID_FILE -ErrorAction SilentlyContinue | Select-Object -First 1
+    $stopped = $false
+    if ($managedPid) {
+        $proc = Get-Process -Id $managedPid -ErrorAction SilentlyContinue
+        if ($proc -and $proc.ProcessName -match "chrome") {
+            Write-Host "[INFO] Stopping managed Chrome (PID $managedPid)..."
+            Stop-Process -Id $managedPid -Force -ErrorAction SilentlyContinue
+            $stopped = $true
+        }
+    }
+    Remove-Item $CHROME_PID_FILE -Force -ErrorAction SilentlyContinue
+    return $stopped
+}
 
 # ── -Stop 模式 ──────────────────────────────────────────────────────────
+# POLICY FIX: the old code did `Get-Process chrome | Stop-Process -Force`,
+# killing EVERY Chrome on the machine — including the user's personal browser
+# with all their tabs. That violates the "never close the user's browser"
+# policy the rest of the repo enforces. Only the PID-tracked instance we
+# launched is stopped now (same model as the Linux daemon's chrome.pid).
 if ($Stop) {
-    Write-Host "[INFO] Stopping all Chrome processes..."
-    $count = (Get-Process -Name "chrome" -ErrorAction SilentlyContinue).Count
-    Get-Process -Name "chrome" -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Seconds 2
-    Write-Host "[OK] Stopped $count chrome process(es)"
+    if (Stop-ManagedChrome) {
+        Start-Sleep -Seconds 2
+        Write-Host "[OK] Managed Chrome stopped"
+    } else {
+        Write-Host "[INFO] No managed Chrome running — nothing to stop"
+    }
     exit 0
 }
 
@@ -88,10 +116,10 @@ try {
     exit 0
 } catch {}
 
-# ── 清理残留 ─────────────────────────────────────────────────────────────
-Write-Host "[INFO] Cleaning up stale Chrome processes..."
-Get-Process -Name "chrome" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 3
+# ── 清理残留（只清理我们自己启动的 Chrome — PID 精确定位，不动用户浏览器）──
+if (Stop-ManagedChrome) {
+    Start-Sleep -Seconds 3
+}
 
 # ── 准备 Profile 目录 ───────────────────────────────────────────────────
 if (-not (Test-Path $PROFILE_DIR)) {
@@ -109,7 +137,13 @@ if (-not (Test-Path $PROFILE_DIR)) {
 $ChromeArgs = @(
     "--remote-debugging-port=$CDP_PORT",
     "--remote-debugging-address=127.0.0.1",
-    "--remote-allow-origins=*",
+    # SECURITY: "--remote-allow-origins=*" removed (parity with the Linux
+    # daemon's fix). Even bound to 127.0.0.1, that flag let ANY webpage open in
+    # ANY local browser connect to ws://127.0.0.1:9222 and take over this
+    # fully-logged-in profile (cookie theft for Google/OpenAI/Anthropic/... in
+    # one shot). Playwright clients send no Origin header, so they are accepted
+    # without it. If a future client ever gets a 403, re-add the narrow form:
+    # "--remote-allow-origins=http://127.0.0.1:$CDP_PORT"
     "--user-data-dir=`"$PROFILE_DIR`"",
     # 切断 Google 云端依赖链（中国网络环境必须）
     "--disable-features=OptimizationHints,Translate,HttpsUpgrades",
@@ -130,7 +164,10 @@ $ChromeArgs = @(
     "--noerrdialogs",
     "--hide-scrollbars",
     "--mute-audio",
-    "--ignore-certificate-errors",
+    # SECURITY: "--ignore-certificate-errors" removed (parity with the Linux
+    # daemon's fix) — proxies tunnel TLS without MITM, so cert errors shouldn't
+    # occur; the flag only made a real MITM invisible on a profile full of
+    # logged-in sessions.
     "--disable-dev-shm-usage"
 )
 
@@ -153,7 +190,8 @@ if ($FirstLogin) {
     Write-Host "    4. Close the Chrome window when done" -ForegroundColor Yellow
     Write-Host ""
 
-    Start-Process -FilePath $CHROME_PATH -ArgumentList "$ChromeArgs $GEMINI_URL"
+    $chromeProc = Start-Process -FilePath $CHROME_PATH -ArgumentList "$ChromeArgs $GEMINI_URL" -PassThru
+    Set-Content -Path $CHROME_PID_FILE -Value $chromeProc.Id
 
     Write-Host -NoNewline "[WAIT] Waiting for CDP port..."
     for ($i = 1; $i -le 60; $i++) {
@@ -167,7 +205,8 @@ if ($FirstLogin) {
 } else {
     # Headless 模式
     $HeadlessArgs = $ChromeArgs + @("--headless=new", "--disable-gpu", "--window-size=1920,1080")
-    $null = Start-Process -FilePath $CHROME_PATH -ArgumentList "$HeadlessArgs $GEMINI_URL" -PassThru
+    $chromeProc = Start-Process -FilePath $CHROME_PATH -ArgumentList "$HeadlessArgs $GEMINI_URL" -PassThru
+    Set-Content -Path $CHROME_PID_FILE -Value $chromeProc.Id
 
     Write-Host -NoNewline "[WAIT] Waiting for CDP port..."
     for ($i = 1; $i -le 30; $i++) {

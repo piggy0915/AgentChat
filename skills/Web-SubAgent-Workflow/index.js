@@ -151,7 +151,11 @@ async function main() {
         timestamp: new Date().toISOString(), ...result,
     }, null, 2));
 
-    process.exit(result.success ? 0 : 2);
+    // P0 FLUSH FIX: exit() immediately after console.log() truncates piped
+    // stdout at the pipe-buffer boundary; the JSON result (full response
+    // embedded) can exceed it. All handles are closed here, so exitCode +
+    // natural exit drains stdout fully. cleanupAllLocks still runs on "exit".
+    process.exitCode = result.success ? 0 : 2;
 }
 
 if (require.main === module) {

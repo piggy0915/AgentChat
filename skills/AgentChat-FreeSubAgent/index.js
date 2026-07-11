@@ -722,7 +722,14 @@ async function main() {
   printStructuredOutput(dag, results, arbitration, Date.now() - T0);
 
   const failCount = Object.values(results).filter(r => !r?.output?.response).length;
-  process.exit(failCount === dag.nodes.length ? 2 : 0);
+  // P0 FLUSH FIX: process.exit() right after console.log() truncates piped
+  // stdout at the pipe-buffer boundary (~128KB Linux, less on Windows) — the
+  // SYNTHESIS BRIEF + raw responses easily exceed that when Claude Code
+  // captures this process's output. Every handle is closed by now (children
+  // reaped, executor timers cleared), so setting exitCode and returning lets
+  // Node drain stdout completely and exit naturally. The process.on("exit")
+  // cleanupAllLocks handler still fires.
+  process.exitCode = failCount === dag.nodes.length ? 2 : 0;
 }
 
 // BUGFIX: previously called main() unconditionally, so simply require()'ing this
