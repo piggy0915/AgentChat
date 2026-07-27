@@ -33,6 +33,11 @@ try {
 // still a working Kimi (same lenient policy as Gemini model activation).
 
 /** CSS selectors for the model-switch trigger button on Kimi's page. */
+// PERF FIX (2026-07): removed 3 overly broad selectors that matched
+// unintended elements ([class*="chat-toolbar"] button, [class*="bottom"]
+// [class*="selector"], [class*="input-area"] [class*="select"]). Playwright's
+// loc.click() calls scrollIntoView() before clicking — a wrong match caused
+// one-time page scrolling that destabilized the SPA's scroll position.
 const MODEL_BTN_SELECTORS = [
     '[class*="model-select"]',
     '[class*="ModelSelect"]',
@@ -40,9 +45,6 @@ const MODEL_BTN_SELECTORS = [
     '[class*="mode-switch"]',
     '[class*="modeSwitch"]',
     'button:has(> [class*="model"])',
-    '[class*="chat-toolbar"] button',
-    '[class*="bottom"] [class*="selector"]',
-    '[class*="input-area"] [class*="select"]',
 ];
 
 /** Text / aria-label patterns that signal fast mode is already active. */
@@ -385,6 +387,10 @@ module.exports = {
     responseSelectors: RESPONSE_SELECTORS,
     responseSelectorTimeout: 60_000,
     stabilityWindow: 8_000,
+    // PERF FIX (2026-07): explicit pollInterval=3000 (was default 2000).
+    // Each poll triggers _domProbe which scans DOM elements; 3s vs 2s
+    // reduces probe frequency by 33%, cutting reflow-induced scroll cycles.
+    pollInterval: 3_000,
     minResponseLength: 10,
 
     // ── Prevent premature "done" during Kimi's multi-round search pauses ──
@@ -413,7 +419,12 @@ module.exports = {
     // bursts for minutes; the cap re-arms on every REAL text change, so it
     // only bounds a terminal stall (e.g. a final answer whose last line
     // happens to look like a status chip).
-    stillGeneratingMaxHoldMs: 180_000,
+    // PERF FIX (2026-07): reduced from 180s to 90s — 3 minutes of polling
+    // at 2s intervals meant up to 90 _domProbe executions, each causing
+    // layout reflows. 90s is sufficient for Kimi's multi-round search
+    // phases (typical: 15-45s), and the cap re-arms on every real text
+    // change so it only bounds terminal stalls.
+    stillGeneratingMaxHoldMs: 90_000,
 
     // ── Reject truncated responses (Kimi occasionally stops mid-sentence) ──
     postResponseHook: async (_page, text) => {
