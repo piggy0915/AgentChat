@@ -12,6 +12,10 @@
  *     stop-control + spinner DOM signals, bounded by stillGeneratingMaxHoldMs
  *   - v12: ensureKimiFastMode — clicks model selector → "快速模式" (fast mode)
  *     for faster, cheaper responses. Gracefully degrades if selector not found.
+ *   - v21: preInputHook Step 0 — dismisses sidebar .mask overlay before
+ *     clearEditor()/click(), preventing the 30s Playwright timeout from
+ *     "subtree intercepts pointer events". Two-layer defense: click mask
+ *     (natural UX), then force display:none as fallback.
  */
 
 const { COMMON_DISMISS_PATTERNS } = require('../../providerFactory');
@@ -313,6 +317,35 @@ module.exports = {
 
     // ── Start fresh conversation + ensure fast mode ──
     preInputHook: async (page) => {
+        // Step 0: Dismiss sidebar mask overlay.
+        // Kimi's sidebar in is-mobile-expanded state renders a <div class="mask">
+        // translucent overlay on top of the main content area. When the
+        // automation flow reaches clearEditor() → editor.click(), Playwright's
+        // actionability check sees the mask intercepting pointer events, retries
+        // 55 times, and fails with a 30s timeout (locator.click: Timeout 30000ms
+        // exceeded — <div class="mask"> subtree intercepts pointer events).
+        //
+        // Two-layer defense:
+        //   1. mask.click() — simulates user tapping the overlay, which triggers
+        //      Kimi's own sidebar-collapse logic (most natural path).
+        //   2. mask.style.display = 'none' — fallback if click doesn't stick
+        //      (e.g. the event listener sits on a parent element).
+        try {
+            const dismissed = await page.evaluate(() => {
+                const mask = document.querySelector('.mask');
+                if (!mask || mask.offsetParent === null) return false;
+                mask.click();
+                return true;
+            });
+            if (dismissed) {
+                await page.waitForTimeout(1000);
+                await page.evaluate(() => {
+                    const m = document.querySelector('.mask');
+                    if (m && m.offsetParent !== null) m.style.display = 'none';
+                }).catch(() => {});
+            }
+        } catch (_) { /* non-critical — proceed with page default */ }
+
         // Step 1: Click "新建会话" to start a fresh conversation
         try {
             const clicked = await page.evaluate(() => {
